@@ -22,6 +22,7 @@ def save_metadata(workload, start, end, out_path, n_partitions, messages_per_sec
         "duration (s)": seconds,
         "epoch_size": epoch_size,
     }
+    metadata["n_threads"] = 1
     #timestamp = datetime.now().strftime("%m%d_%H%M")
     #save_dir = os.path.join(out_path, f"{workload}_{messages_per_second}tps_{n_partitions}part_{timestamp}")
     save_data(metadata, out_path, "metadata.json")

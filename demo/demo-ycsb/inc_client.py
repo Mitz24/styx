@@ -53,7 +53,7 @@ ycsb_operator.set_n_partitions(N_PARTITIONS)
 g.add_operators(ycsb_operator)
 
 INTERVAL_SECONDS = 15
-DELTA_TPS = 500 
+DELTA_TPS = 1000 
 
 def submit_graph(styx: SyncStyxClient):
     print(f'Partitions: {list(g.nodes.values())[0].n_partitions}')

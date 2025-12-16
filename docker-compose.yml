@@ -25,6 +25,7 @@ services:
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.retention.time=0" # disable time-based retention
+      - "--web.enable-admin-api"
 
   grafana:
     image: grafana/grafana:11.5.2-ubuntu

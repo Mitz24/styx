@@ -136,6 +136,8 @@ minio-volume
 *.pdf
 !docs/assets/**/*.pdf
 !metadata.json
+!meta.json
+backup/
 
 demo/demo-tpc-c/tpcc-generator/tpcc-generator
 styx.sublime-workspace

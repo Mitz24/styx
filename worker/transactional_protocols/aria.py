@@ -562,7 +562,9 @@ class AriaProtocol(BaseTransactionalProtocol):
                         func_time_ms = round((end_func - start_func) * 1000, 4)
                         chain_time_ms = round((end_chain - start_chain) * 1000, 4)
                         fallback_time_ms = round((end_fallback - start_fallback) * 1000, 4)
-                        self._processing_time_ms = func_time_ms + chain_time_ms + fallback_time_ms
+                        conflict_resolution_time_ms = round((conflict_resolution_end - conflict_resolution_start) * 1000, 4)
+                        commit_time_ms = round((end_commit - start_commit) * 1000, 4)
+                        self._processing_time_ms = func_time_ms + conflict_resolution_time_ms + fallback_time_ms + commit_time_ms
                         
                         # utilization: ratio of processing time to total time
                         total_time_ms = self._idle_time_ms + epoch_latency
@@ -599,8 +601,8 @@ class AriaProtocol(BaseTransactionalProtocol):
                                                          func_time_ms,
                                                          chain_time_ms,
                                                          round(sync_time * 1000, 4),
-                                                         round((conflict_resolution_end - conflict_resolution_start) * 1000, 4),
-                                                         round((end_commit - start_commit) * 1000, 4),
+                                                         conflict_resolution_time_ms,
+                                                         commit_time_ms,
                                                          fallback_time_ms,
                                                          round((snap_end - snap_start) * 1000, 4),
                                                          len(self.sequencer.distributed_log) + len(self.sequencer.current_epoch),
