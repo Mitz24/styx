@@ -935,7 +935,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Processing time / Total epoch time\nUsed to identify workers that are spending most of the time idle ",
+      "description": "Processing time / Total epoch time\nUsed to identify workers that are spending most of the time idle or on I/O tasks",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1240,7 +1240,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "TPS per operator -> calculated as total latency of the operator in the epoch / epoch duration",
+      "description": "TPS per operator -> calculated as operator execution time in the epoch / total epoch latency",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1832,7 +1832,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               },
               {
                 "color": "orange",
@@ -1916,6 +1917,6 @@
   "timezone": "browser",
   "title": "Styx System Overview",
   "uid": "beckc0nxpeupsf",
-  "version": 14,
+  "version": 1,
   "weekStart": ""
 }
