@@ -48,6 +48,35 @@ class WorkerPool(object):
         self.operator_partition_to_worker: dict[tuple[str, int], int] = {}
         self.orphaned_operator_assignments: dict[tuple[str, int], Operator] = {}
 
+    def get_live_workers(self) -> list[Worker]:
+        """Returns all currently known (non-tombstoned) workers, including standby ones."""
+        live: list[Worker] = []
+        for _, _, worker in self._queue:
+            if worker == self._tombstone:
+                continue
+            live.append(worker)
+        return live
+
+    def reset_all_assignments(self):
+        """
+        Clears all operator assignments and rebuilds the priority queue.
+
+        This is useful for manual rebalance (e.g., after scaling up), where we want to
+        redistribute partitions across *all* live workers.
+        """
+        live_workers = self.get_live_workers()
+        for w in live_workers:
+            w.assigned_operators = {}
+        self.operator_partition_to_worker.clear()
+        self.orphaned_operator_assignments.clear()
+
+        # Rebuild heap and index maps
+        self._queue = []
+        self._worker_queue_idx = {}
+        self._index = 0
+        for w in live_workers:
+            self.put(w)
+
     def register_worker(self,
                         worker_ip: str,
                         worker_port: int,

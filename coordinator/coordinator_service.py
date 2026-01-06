@@ -10,7 +10,7 @@ from timeit import default_timer as timer
 import uvloop
 from minio import Minio
 import minio.error
-from prometheus_client import start_http_server, Gauge
+from prometheus_client import start_http_server, Gauge, Counter
 
 from styx.common.logging import logging
 from styx.common.message_types import MessageType
@@ -151,6 +151,28 @@ class CoordinatorService(object):
         self.operator_latency_gauge = Gauge("operator_latency_ms",
                                             "Average operator call latency in ms for this epoch",
                                             ["instance", "operator", "partition"])
+
+        # Phase-attributed resource metrics (aggregated per epoch in the worker, scraped at coordinator).
+        self.phase_cpu_seconds_total = Counter(
+            "phase_cpu_seconds_total",
+            "Process CPU time attributed to a transactional protocol phase (seconds, cumulative)",
+            ["instance", "phase"],
+        )
+        self.phase_net_rx_bytes_total = Counter(
+            "phase_net_rx_bytes_total",
+            "Network RX bytes attributed to a transactional protocol phase (bytes, cumulative)",
+            ["instance", "phase"],
+        )
+        self.phase_net_tx_bytes_total = Counter(
+            "phase_net_tx_bytes_total",
+            "Network TX bytes attributed to a transactional protocol phase (bytes, cumulative)",
+            ["instance", "phase"],
+        )
+        self.phase_rss_max_mb = Gauge(
+            "phase_rss_max_mb",
+            "Max RSS observed during a transactional protocol phase within the last reported epoch (MB)",
+            ["instance", "phase"],
+        )
         
     # Refactoring candidate
     async def coordinator_controller(self, transport, data, pool: concurrent.futures.ProcessPoolExecutor):
@@ -204,6 +226,20 @@ class CoordinatorService(object):
                 (worker_id,) = self.networking.decode_message(data)
                 self.coordinator.worker_is_ready_after_recovery(worker_id)
                 logging.info(f'ready after recovery received from: {worker_id}')
+            case MessageType.Rebalance:
+                # Manual rebalance trigger (e.g., after scaling up/down workers).
+                async with self.recovery_lock:
+                    logging.warning("Manual rebalance requested")
+                    await self.coordinator.rebalance_cluster()
+                    # Reuse the recovery orchestration steps.
+                    await self.coordinator.send_recovery_to_participating_workers()
+                    logging.warning("Waiting on the cluster to become healthy (rebalance)")
+                    await self.coordinator.wait_cluster_healthy()
+                    logging.warning("Cleaning up protocol after rebalance")
+                    self.aria_metadata = AriaSyncMetadata(len(self.coordinator.worker_pool.get_participating_workers()))
+                    await self.protocol_networking.close_all_connections()
+                    logging.warning("Notify workers after rebalance")
+                    await self.coordinator.notify_cluster_healthy()
             case _:
                 # Any other message type
                 logging.error(f"COORDINATOR SERVER: Non supported message type: {message_type}")
@@ -241,15 +277,17 @@ class CoordinatorService(object):
                     await self.aria_metadata.cleanup()
             case MessageType.SyncCleanup | MessageType.AriaFallbackStart | MessageType.AriaFallbackDone:
                 if message_type == MessageType.SyncCleanup:
+                    decoded = self.protocol_networking.decode_message(data)
                     (worker_id, epoch_throughput, epoch_latency,
                      local_abort_rate, wal_time, func_time, chain_ack_time,
                      sync_time, conflict_res_time, commit_time,
-                     fallback_time, snap_time, sequencer_backpressure, 
+                     fallback_time, snap_time, sequencer_backpressure,
                      queue_backlog, idle_time_ms,
-                     total_txns, committed_txns, logic_aborts, 
+                     total_txns, committed_txns, logic_aborts,
                      concurrency_aborts, committed_lock_free,
                      committed_fallback, empty_epoch, utilization,
-                     operator_epoch_stats) = self.protocol_networking.decode_message(data)
+                     operator_epoch_stats, *rest) = decoded
+                    phase_resources = rest[0] if rest else None
                     
                     self.epoch_throughput_gauge.labels(instance=worker_id).set(epoch_throughput)
                     self.epoch_latency_gauge.labels(instance=worker_id).set(epoch_latency)
@@ -286,6 +324,21 @@ class CoordinatorService(object):
                         self.operator_tps_gauge.labels(**labels).set(tps)
                         self.operator_call_count_gauge.labels(**labels).set(call_count)
                         self.operator_latency_gauge.labels(**labels).set(avg_latency_ms)
+
+                    # Optional per-phase resource attribution (newer workers append this payload).
+                    if phase_resources:
+                        cpu_ns = phase_resources.get("cpu_ns", {})
+                        rx_bytes = phase_resources.get("rx_bytes", {})
+                        tx_bytes = phase_resources.get("tx_bytes", {})
+                        rss_max_bytes = phase_resources.get("rss_max_bytes", {})
+                        for phase, v in cpu_ns.items():
+                            self.phase_cpu_seconds_total.labels(instance=worker_id, phase=phase).inc(float(v) / 1e9)
+                        for phase, v in rx_bytes.items():
+                            self.phase_net_rx_bytes_total.labels(instance=worker_id, phase=phase).inc(float(v))
+                        for phase, v in tx_bytes.items():
+                            self.phase_net_tx_bytes_total.labels(instance=worker_id, phase=phase).inc(float(v))
+                        for phase, v in rss_max_bytes.items():
+                            self.phase_rss_max_mb.labels(instance=worker_id, phase=phase).set(float(v) / (1024 * 1024))
                     
                 sync_complete: bool = await self.aria_metadata.set_empty_sync_done()
                 if sync_complete:

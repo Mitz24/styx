@@ -228,6 +228,40 @@ class Coordinator(object):
                                                          key=metadata_key,
                                                          value=serialized_graph)
 
+    async def rebalance_cluster(self):
+        """
+        Redistribute operator partitions across all *live* workers.
+
+        This is meant for manual scaling experiments: after you add/remove workers, call this
+        to trigger an InitRecovery from the latest completed snapshot with a new assignment.
+        """
+        if not self.graph_submitted or self.submitted_graph is None:
+            logging.warning("Rebalance requested but no graph is currently submitted.")
+            return
+
+        snap_id = self.get_current_completed_snapshot_id()
+        if snap_id < 0:
+            logging.warning("Rebalance requested but no completed snapshot is available yet.")
+            return
+
+        # Reset all assignments and re-schedule partitions round-robin across live workers.
+        self.worker_pool.reset_all_assignments()
+        for operator_name, operator in iter(self.submitted_graph):
+            for partition in range(operator.n_partitions):
+                operator_copy = deepcopy(operator)
+                self.worker_pool.schedule_operator_partition((operator_name, partition), operator_copy)
+        for operator_name, operator in iter(self.submitted_graph):
+            for shadow_partition in range(operator.n_partitions, MAX_OPERATOR_PARALLELISM):
+                operator_copy = deepcopy(operator)
+                operator_copy.make_shadow()
+                self.worker_pool.schedule_operator_partition((operator_name, shadow_partition), operator_copy)
+
+        logging.warning(
+            f"Rebalance | live_workers={len(self.worker_pool.get_live_workers())} "
+            f"participating={len(self.worker_pool.get_participating_workers())} "
+            f"snapshot_id={snap_id}"
+        )
+
     async def create_kafka_ingress_topics(self, stateflow_graph: StateflowGraph):
         if KAFKA_URL is None:
             logging.error('Kafka URL not given')

@@ -25,6 +25,7 @@ from worker.operator_state.aria.conflict_detection_types import AriaConflictDete
 from worker.operator_state.aria.in_memory_state import InMemoryOperatorState
 from worker.operator_state.stateless import Stateless
 from worker.sequencer.sequencer import Sequencer
+from worker.util.phase_resource_tracker import PhaseResourceTracker
 
 
 DISCOVERY_HOST: str = os.environ['DISCOVERY_HOST']
@@ -33,7 +34,7 @@ DISCOVERY_PORT: int = int(os.environ['DISCOVERY_PORT'])
 CONFLICT_DETECTION_METHOD: AriaConflictDetectionType = AriaConflictDetectionType(os.getenv('CONFLICT_DETECTION_METHOD',
                                                                                            0))
 # if more than 10% aborts use fallback strategy
-FALLBACK_STRATEGY_PERCENTAGE: float = float(os.getenv('FALLBACK_STRATEGY_PERCENTAGE', -0.1))
+FALLBACK_STRATEGY_PERCENTAGE: float = float(os.getenv('FALLBACK_STRATEGY_PERCENTAGE', 0.1))
 # snapshot each N epochs
 SNAPSHOT_FREQUENCY: int = int(os.getenv('SNAPSHOT_FREQUENCY_SEC', 10))
 SNAPSHOTTING_THREADS: int = int(os.getenv('SNAPSHOTTING_THREADS', 4))
@@ -159,6 +160,8 @@ class AriaProtocol(BaseTransactionalProtocol):
         self._processing_time_ms: float = 0.0  # Time spent in actual function execution
         
         self.operator_metrics = {}
+        # Per-phase resource attribution (CPU/RSS/RX/TX deltas), aggregated per epoch.
+        self.phase_resource_tracker = PhaseResourceTracker()
 
     def record_operator_call(self, operator_name, partition, function_name, duration_ms, success: bool):
         key = (operator_name, partition, function_name)
@@ -377,6 +380,8 @@ class AriaProtocol(BaseTransactionalProtocol):
                                        f"empty_epoch: {self._empty_epoch}")
                         self.currently_processing = True
                         logging.info(f'{self.id} ||| Epoch: {self.sequencer.epoch_counter} starts')
+                        # Reset per-epoch phase resource accounting at the same boundary as epoch timers.
+                        self.phase_resource_tracker.reset_epoch()
                         # Run all the epochs functions concurrently
                         sync_time = 0.0
                         start_wal = 0.0
@@ -389,6 +394,7 @@ class AriaProtocol(BaseTransactionalProtocol):
                         logging.info(f'{self.id} ||| Running {len(sequence)} functions...')
                         # async with self.snapshot_state_lock:
                         if sequence:
+                            self.phase_resource_tracker.begin("WAL")
                             start_wal = timer()
                             sequence_to_log = msgpack_serialization({seq_item.payload.request_id: seq_item.t_id
                                                                      for seq_item in sequence})
@@ -396,20 +402,26 @@ class AriaProtocol(BaseTransactionalProtocol):
                                                                     message=sequence_to_log,
                                                                     topic='sequencer-wal')
                             end_wal = timer()
+                            self.phase_resource_tracker.end("WAL")
                             logging.info(f"Write to WAL successful at epoch: {self.sequencer.epoch_counter}")
+                            self.phase_resource_tracker.begin("1st Run")
                             start_func = timer()
                             await asyncio.gather(*[self.run_function(sequenced_item.t_id, sequenced_item.payload)
                                                    for sequenced_item in sequence])
                             end_func = timer()
+                            self.phase_resource_tracker.end("1st Run")
                             # Wait for chains to finish
 
                             logging.info(f'{self.id} ||| '
                                          f'Waiting on chained {len(self.networking.waited_ack_events)} functions...')
+                            self.phase_resource_tracker.begin("Chain Acks")
                             start_chain = timer()
                             await asyncio.gather(*[ack.wait()
                                                    for ack in self.networking.waited_ack_events.values()])
                             end_chain = timer()
+                            self.phase_resource_tracker.end("Chain Acks")
 
+                        self.phase_resource_tracker.begin("SYNC")
                         start_sync = timer()
                         # Capture LOCAL logic aborts before sync overwrites with global
                         logic_aborts_count = len(self.networking.logic_aborts_everywhere)
@@ -419,10 +431,12 @@ class AriaProtocol(BaseTransactionalProtocol):
                                                 serializer=Serializer.PICKLE)
                         end_sync = timer()
                         sync_time += end_sync - start_sync
+                        self.phase_resource_tracker.end("SYNC")
                         logging.info(f'{self.id} ||| '
                                      f'logic_aborts_everywhere: {self.networking.logic_aborts_everywhere}')
                         # HERE WE KNOW ALL THE LOGIC ABORTS
                         # removing the global logic abort transactions from the commit phase
+                        self.phase_resource_tracker.begin("Conflict Resolution")
                         conflict_resolution_start = timer()
                         self.local_state.remove_aborted_from_rw_sets(self.networking.logic_aborts_everywhere)
                         # Check for local state conflicts
@@ -442,12 +456,14 @@ class AriaProtocol(BaseTransactionalProtocol):
                             logging.error('This conflict detection method number is not a valid number')
                             exit()
                         conflict_resolution_end = timer()
+                        self.phase_resource_tracker.end("Conflict Resolution")
                         if sequence:
                             local_abort_rate = len(concurrency_aborts) / len(sequence)
                         else:
                             local_abort_rate = 0.0
                         # Notify peers that we are ready to commit
                         logging.info(f'{self.id} ||| Notify peers...')
+                        self.phase_resource_tracker.begin("SYNC")
                         start_sync = timer()
                         await self.sync_workers(msg_type=MessageType.AriaCommit,
                                                 message=(concurrency_aborts,
@@ -456,8 +472,10 @@ class AriaProtocol(BaseTransactionalProtocol):
                                                 serializer=Serializer.PICKLE)
                         end_sync = timer()
                         sync_time += end_sync - start_sync
+                        self.phase_resource_tracker.end("SYNC")
                         # HERE WE KNOW ALL THE CONCURRENCY ABORTS
                         logging.info(f'{self.id} ||| Starting commit!')
+                        self.phase_resource_tracker.begin("Commit time")
                         start_commit = timer()
                         self.local_state.commit(self.concurrency_aborts_everywhere)
 
@@ -473,6 +491,7 @@ class AriaProtocol(BaseTransactionalProtocol):
                             msgpack.decode(msgpack.encode(self.networking.aborted_events))
                         ))
                         end_commit = timer()
+                        self.phase_resource_tracker.end("Commit time")
 
                         logging.info(f'{self.id} ||| Sequence committed!')
 
@@ -483,6 +502,7 @@ class AriaProtocol(BaseTransactionalProtocol):
                         committed_lock_free = len(sequence) - len(local_aborted_t_ids)
                         committed_fallback = 0
 
+                        self.phase_resource_tracker.begin("Fallback")
                         start_fallback = timer()
                         abort_rate: float = len(self.concurrency_aborts_everywhere) / self.total_processed_seq_size
 
@@ -501,6 +521,7 @@ class AriaProtocol(BaseTransactionalProtocol):
                             concurrency_aborts = set()
                             self.t_ids_to_reschedule = set()
                         end_fallback = timer()
+                        self.phase_resource_tracker.end("Fallback")
 
                         partition_reqs = defaultdict(int)
                         for sequenced_item in sequence:
@@ -525,9 +546,11 @@ class AriaProtocol(BaseTransactionalProtocol):
                         )
                         await self.wait_responses_to_be_sent.wait()
                         self.cleanup_after_epoch()
+                        self.phase_resource_tracker.begin("Async Snapshot")
                         snap_start = timer()
                         self.take_snapshot(pool)
                         snap_end = timer()
+                        self.phase_resource_tracker.end("Async Snapshot")
                         epoch_end = timer()
                         epoch_latency = max(round((epoch_end - epoch_start) * 1000, 4), 1)
                         epoch_throughput = ((len(sequence) - len(concurrency_aborts)) * 1000) // epoch_latency # TPS
@@ -591,6 +614,7 @@ class AriaProtocol(BaseTransactionalProtocol):
                             )
                         # Reset per-epoch operator metrics after epoch
                         self.operator_metrics.clear()
+                        phase_resources = self.phase_resource_tracker.export()
                         
                         await self.sync_workers(msg_type=MessageType.SyncCleanup,
                                                 message=(self.id,
@@ -616,7 +640,8 @@ class AriaProtocol(BaseTransactionalProtocol):
                                                          committed_fallback,
                                                          self._empty_epoch,
                                                          round(utilization, 4),
-                                                         operator_epoch_stats),
+                                                         operator_epoch_stats,
+                                                         phase_resources),
                                                 serializer=Serializer.MSGPACK)
                         # Mark the end of this epoch for idle time tracking
                         self._last_epoch_end_time = timer()

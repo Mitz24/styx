@@ -1,0 +1,17 @@
+{
+	"ulid": "01KEABE1244J2P9VETPVTC1DTY",
+	"minTime": 1765893600000,
+	"maxTime": 1765900800000,
+	"stats": {
+		"numSamples": 94855,
+		"numSeries": 145,
+		"numChunks": 828
+	},
+	"compaction": {
+		"level": 1,
+		"sources": [
+			"01KEABE1244J2P9VETPVTC1DTY"
+		]
+	},
+	"version": 1
+}

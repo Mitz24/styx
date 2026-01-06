@@ -32,3 +32,4 @@ class MessageType(IntEnum):
     SnapMarker = 99
     AlignStart = 100
     AlignEnd = 101
+    Rebalance = 102

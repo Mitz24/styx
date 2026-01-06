@@ -1,0 +1,17 @@
+{
+	"ulid": "01KEABE13BZM5KRTW1C34FRNZV",
+	"minTime": 1765901687772,
+	"maxTime": 1765908000000,
+	"stats": {
+		"numSamples": 1120,
+		"numSeries": 5,
+		"numChunks": 15
+	},
+	"compaction": {
+		"level": 1,
+		"sources": [
+			"01KEABE13BZM5KRTW1C34FRNZV"
+		]
+	},
+	"version": 1
+}
