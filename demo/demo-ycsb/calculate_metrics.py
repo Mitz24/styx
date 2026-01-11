@@ -160,7 +160,6 @@ def main(
     print(f'Done. Persisted metrics in {save_dir}/{exp_name}.json')
     with open(f'{save_dir}/{exp_name}.json', 'w', encoding='utf-8') as f:
         json.dump(res_dict, f, ensure_ascii=False, indent=4)
-    return are_we_consistent
 
 
 if __name__ == '__main__':

@@ -1,5 +1,4 @@
 services:
-
   coordinator:
     build:
       context: .
@@ -14,6 +13,9 @@ services:
       - KAFKA_URL=kafka1:19092
       - HEARTBEAT_LIMIT=5000
       - HEARTBEAT_CHECK_INTERVAL=500
+    depends_on:
+      - prometheus
+      - grafana
 
   prometheus:
     image: prom/prometheus:v3.2.1
@@ -21,10 +23,10 @@ services:
       - "9090:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
-      - ./prometheus-data:/prometheus   
+      - ./prometheus-data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.retention.time=0" # disable time-based retention
+      - "--storage.tsdb.retention.time=365d"
       - "--web.enable-admin-api"
 
   grafana:
@@ -33,14 +35,12 @@ services:
       - "3001:3000"
     environment:
       - GF_AUTH_ANONYMOUS_ENABLED=true
-      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin  # Optional: Grant Admin rights to anonymous users
-      - GF_AUTH_DISABLE_LOGIN_FORM=true   # Optional: Hide the login form
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin # Optional: Grant Admin rights to anonymous users
+      - GF_AUTH_DISABLE_LOGIN_FORM=true # Optional: Hide the login form
     volumes:
       - ./grafana_data:/var/lib/grafana
-      - ./grafana/provisioning:/etc/grafana/provisioning  # Auto-config
-      - ./grafana/dashboards:/etc/grafana/dashboards      # Load dashboards
-
-
+      - ./grafana/provisioning:/etc/grafana/provisioning # Auto-config
+      - ./grafana/dashboards:/etc/grafana/dashboards # Load dashboards
 
   worker:
     build:
@@ -48,7 +48,6 @@ services:
       dockerfile: worker/worker.dockerfile
     image: dev/styx:latest
     environment:
-      - WORKER_THREADS=1
       - INGRESS_TYPE=KAFKA
       - KAFKA_URL=kafka1:19092
       - DISCOVERY_HOST=coordinator
@@ -56,12 +55,15 @@ services:
     env_file:
       - env/minio.env
     #deploy:
-      #resources:
-        #limits:
-        #  cpus: '0.25'
-        #  memory: 4096M
-#        reservations:
-#          cpus: '2'
+    #resources:
+    #limits:
+    #  cpus: '0.25'
+    #  memory: 4096M
+    #        reservations:
+    #          cpus: '2'
+    #    cpus: ${STYX_WORKER_THREADS}
+    depends_on:
+      - coordinator
 
 volumes:
   grafana_data:
