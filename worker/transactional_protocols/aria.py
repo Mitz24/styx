@@ -166,7 +166,7 @@ class AriaProtocol(BaseTransactionalProtocol):
         # Track epochs with no local work (forced to sync by coordinator)
         self._empty_epoch: bool = False  # True if current epoch had no local sequence
         # Processing time tracking for utilization calculation
-        self._processing_time_ms: float = 0.0  # Time spent in actual function execution
+        self.cpu_work_ms: float = 0.0  # Time spent in actual function execution
         
         self.operator_metrics = {}
         # Per-phase resource attribution (CPU/RSS/RX/TX deltas), aggregated per epoch.
@@ -637,11 +637,16 @@ class AriaProtocol(BaseTransactionalProtocol):
                     fallback_time_ms = round((end_fallback - start_fallback) * 1000, 4)
                     conflict_resolution_time_ms = round((conflict_resolution_end - conflict_resolution_start) * 1000, 4)
                     commit_time_ms = round((end_commit - start_commit) * 1000, 4)
-                    self._processing_time_ms = func_time_ms + conflict_resolution_time_ms + fallback_time_ms + commit_time_ms
-                    
-                    # utilization: ratio of processing time to total time
-                    total_time_ms = self._idle_time_ms + epoch_latency
-                    utilization = (self._processing_time_ms / total_time_ms) if total_time_ms > 0 else 0.0
+                    wal_time_ms = round((end_wal - start_wal) * 1000, 4)
+                    snap_time_ms = round((snap_end - snap_start) * 1000, 4)
+                    sync_time_ms = round(sync_time * 1000, 4)
+
+                    cpu_work_ms = func_time_ms + conflict_resolution_time_ms + fallback_time_ms
+                    io_wait_time_ms = wal_time_ms + snap_time_ms + sync_time_ms #+ commit_time_ms
+                    # ratio of processing time to total time
+                    cpu_utilization = (cpu_work_ms / epoch_latency) if epoch_latency > 0 else 0.0
+                    # ratio of IO wait time to total time
+                    io_wait_utilization = (io_wait_time_ms / epoch_latency) if epoch_latency > 0 else 0.0
 
                     operator_agg: dict[tuple[str, int], dict[str, float | int]] = {}
                     for (op_name, partition, _func_name), m in self.operator_metrics.items():
@@ -688,14 +693,14 @@ class AriaProtocol(BaseTransactionalProtocol):
                                                      epoch_throughput,
                                                      epoch_latency,
                                                      local_abort_rate,
-                                                     round((end_wal - start_wal) * 1000, 4),
+                                                     wal_time_ms,
                                                      func_time_ms,
                                                      chain_time_ms,
-                                                     round(sync_time * 1000, 4),
+                                                     sync_time_ms,
                                                      conflict_resolution_time_ms,
                                                      commit_time_ms,
                                                      fallback_time_ms,
-                                                     round((snap_end - snap_start) * 1000, 4),
+                                                     snap_time_ms,
                                                      len(self.sequencer.distributed_log) + len(self.sequencer.current_epoch),
                                                      total_lag,
                                                      round(self._idle_time_ms, 4),
@@ -706,7 +711,8 @@ class AriaProtocol(BaseTransactionalProtocol):
                                                      committed_lock_free,
                                                      committed_fallback,
                                                      self._empty_epoch,
-                                                     round(utilization, 4),
+                                                     cpu_utilization, 
+                                                     io_wait_utilization,
                                                      operator_epoch_stats,
                                                      phase_resources),
                                             serializer=Serializer.MSGPACK)

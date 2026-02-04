@@ -39,6 +39,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
+      "description": "The amount of CPU time consumed by each of the different transactional phases in ms",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -90,7 +91,8 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "ms"
         },
         "overrides": []
       },
@@ -118,13 +120,14 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "rate(phase_cpu_seconds_total[5s])",
+          "expr": "rate(phase_cpu_ms_total[5s])",
+          "hide": false,
           "legendFormat": "{{phase}} ({{exported_instance}})",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "CPU per phase",
+      "title": "CPU per phase (ms)",
       "type": "timeseries"
     },
     {
@@ -183,7 +186,8 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "bytes"
         },
         "overrides": []
       },
@@ -276,7 +280,8 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "bytes"
         },
         "overrides": []
       },
@@ -318,6 +323,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
+      "description": "System-wide CPU utilization",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -419,7 +425,9 @@
       "pluginVersion": "11.5.2",
       "targets": [
         {
+          "editorMode": "code",
           "expr": "avg by(instance) (worker_cpu_usage_percent)",
+          "range": true,
           "refId": "A"
         }
       ],
@@ -530,7 +538,9 @@
       "pluginVersion": "11.5.2",
       "targets": [
         {
+          "editorMode": "code",
           "expr": "avg by(instance) (worker_memory_usage_mb) * 1000000",
+          "range": true,
           "refId": "A"
         }
       ],
@@ -865,7 +875,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum(rate(worker_epoch_throughput_tps[15s]))",
+          "expr": "sum(rate(epoch_total_transactions_total[15s]))",
           "range": true,
           "refId": "A"
         }
@@ -989,6 +999,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
+      "description": "Calculates the per-second average rate of the different types of commits and aborts for each epoch",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1068,7 +1079,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "epoch_committed_lock_free > 0",
+          "expr": "rate(epoch_committed_lock_free_total[15s]) > 0",
           "legendFormat": "lock_free_commited ({{exported_instance}})",
           "range": true,
           "refId": "A"
@@ -1079,7 +1090,7 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "epoch_committed_fallback > 0",
+          "expr": "rate(epoch_committed_fallback_total[15s])> 0",
           "hide": false,
           "instant": false,
           "legendFormat": "fallback_comitted ({{exported_instance}})",
@@ -1092,7 +1103,7 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "epoch_logic_aborts > 0",
+          "expr": "rate(epoch_logic_aborts_total[15s]) > 0",
           "hide": false,
           "instant": false,
           "legendFormat": "logic_aborts ({{exported_instance}})",
@@ -1105,7 +1116,7 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "epoch_concurrency_aborts > 0",
+          "expr": "rate(epoch_concurrency_aborts_total[15s]) > 0",
           "hide": false,
           "instant": false,
           "legendFormat": "concurrency_aborts ({{exported_instance}})",
@@ -1113,7 +1124,7 @@
           "refId": "D"
         }
       ],
-      "title": "Num transactions per epoch",
+      "title": "Average Commit & Abort Count",
       "type": "timeseries"
     },
     {
@@ -1172,7 +1183,8 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "ms"
         },
         "overrides": []
       },
@@ -1214,7 +1226,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Processing time / Total epoch time\nUsed to identify workers that are spending most of the time idle or on I/O tasks",
+      "description": "CPU Ratio - ratio of processing time to total epoch time. Calculated as latency needed for processing heavy phases divided by the total epoch time\nIO Ratio - similar but for IO",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1263,10 +1275,11 @@
               },
               {
                 "color": "green",
-                "value": 0.5
+                "value": 50
               }
             ]
-          }
+          },
+          "unit": "percent"
         },
         "overrides": []
       },
@@ -1298,12 +1311,25 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "avg_over_time(worker_utilization[5s])",
+          "expr": "avg_over_time(worker_cpu_utilization[5s]) * 100",
           "hide": false,
           "instant": false,
-          "legendFormat": "Utilisation ({{exported_instance}})",
+          "legendFormat": "CPU ({{exported_instance}})",
           "range": true,
-          "refId": "B"
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "avg_over_time(worker_io_utilization[5s]) * 100",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "IO ({{exported_instance}})",
+          "range": true,
+          "refId": "C"
         }
       ],
       "title": "Worker Utilisation",
@@ -1477,7 +1503,8 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "ms"
         },
         "overrides": []
       },
@@ -1506,6 +1533,7 @@
         {
           "editorMode": "code",
           "expr": "avg by (operator) (operator_latency_ms)",
+          "hide": false,
           "legendFormat": "{{operator}}",
           "range": true,
           "refId": "A"
@@ -1598,11 +1626,17 @@
       "pluginVersion": "11.5.2",
       "targets": [
         {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
           "editorMode": "code",
-          "expr": "avg by (operator) (operator_tps)",
-          "legendFormat": "{{operator}}",
+          "expr": "avg by (operator) (rate(operator_tps_total[5s]))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "__auto",
           "range": true,
-          "refId": "A"
+          "refId": "B"
         }
       ],
       "title": "Operator TPS",
@@ -1613,7 +1647,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Number of times a call goes through an operator during the epoch",
+      "description": "Number of times a call goes through an operator during the epoch per worker",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1693,8 +1727,8 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "avg by (operator) (operator_call_count)",
-          "legendFormat": "{{operator}}",
+          "expr": "(rate(operator_call_count_total[15s])) > 0",
+          "legendFormat": "{{operator}} ({{exported_instance}})",
           "range": true,
           "refId": "A"
         }
@@ -2060,7 +2094,8 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "ms"
         },
         "overrides": []
       },
@@ -2196,6 +2231,6 @@
   "timezone": "browser",
   "title": "Styx System Overview",
   "uid": "beckc0nxpeupsf",
-  "version": 4,
+  "version": 3,
   "weekStart": ""
 }

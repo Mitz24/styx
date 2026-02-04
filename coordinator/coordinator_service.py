@@ -121,43 +121,47 @@ class CoordinatorService(object):
         self.queue_backlog_gauge = Gauge("queue_backlog",
                                         "Backlog in the worker queue",
                                         ["instance"])
-        self.idle_time_ms_per_second_gauge = Gauge("idle_time_ms_per_second",
+        self.idle_time_ms_gauge = Gauge("idle_time_ms_per_second",
                                         "Idle time ms per second",
                                         ["instance"])
         
         # Transaction count metrics
-        self.epoch_total_txns_gauge = Gauge("epoch_total_transactions",
-                                            "Total transactions in epoch",
-                                            ["instance"])
-        self.epoch_committed_txns_gauge = Gauge("epoch_committed_transactions",
-                                                "Committed transactions in epoch",
+        self.epoch_total_txns_counter = Counter("epoch_total_transactions",
+                                                "Total transactions processed (cumulative)",
                                                 ["instance"])
-        self.epoch_logic_aborts_gauge = Gauge("epoch_logic_aborts",
-                                              "Logic/global aborts in epoch",
-                                              ["instance"])
-        self.epoch_concurrency_aborts_gauge = Gauge("epoch_concurrency_aborts",
-                                                    "Concurrency aborts in epoch",
+        self.epoch_committed_txns_counter = Counter("epoch_committed_transactions",
+                                                    "Committed transactions (cumulative)",
                                                     ["instance"])
-        self.epoch_committed_lock_free_gauge = Gauge("epoch_committed_lock_free",
-                                                     "Transactions committed in lock-free phase",
-                                                     ["instance"])
-        self.epoch_committed_fallback_gauge = Gauge("epoch_committed_fallback",
-                                                    "Transactions committed in fallback phase",
-                                                    ["instance"])
+        self.epoch_logic_aborts_counter = Counter("epoch_logic_aborts",
+                                                  "Logic/global aborts (cumulative)",
+                                                  ["instance"])
+        self.epoch_concurrency_aborts_counter = Counter("epoch_concurrency_aborts",
+                                                        "Concurrency aborts (cumulative)",
+                                                        ["instance"])
+        self.epoch_committed_lock_free_counter = Counter("epoch_committed_lock_free",
+                                                         "Transactions committed in lock-free phase (cumulative)",
+                                                         ["instance"])
+        self.epoch_committed_fallback_counter = Counter("epoch_committed_fallback",
+                                                        "Transactions committed in fallback phase (cumulative)",
+                                                        ["instance"])
         # Metrics for downscaling policies
         self.empty_epoch_gauge = Gauge("worker_empty_epoch",
                                        "1 if epoch had no local work (just sync), 0 otherwise",
                                        ["instance"])
-        self.utilization_gauge = Gauge("worker_utilization",
-                                       "Ratio of processing time to total time (0.0-1.0)",
-                                       ["instance"])
+
+        self.cpu_utilization_ratio_gauge = Gauge("worker_cpu_utilization",
+                                           "Ratio of CPU work in the epoch",
+                                           ["instance"])
+        self.io_utilization_ratio_gauge = Gauge("worker_io_utilization",
+                                               "Ratio of IO wait time in the epoch",
+                                               ["instance"])
         # Operator-level performance metrics
-        self.operator_tps_gauge = Gauge("operator_tps",
-                                        "Transactions per second per operator partition",
+        self.operator_tps_counter = Counter("operator_tps",
+                                        "Transactions per second per operator partition (cumulative)",
                                         ["instance", "operator", "partition"])
-        self.operator_call_count_gauge = Gauge("operator_call_count",
-                                                      "Number of calls to an operator partition",
-                                                      ["instance", "operator", "partition"])
+        self.operator_call_count_counter = Counter("operator_call_count",
+                                                        "Number of calls to an operator partition (cumulative)",
+                                                        ["instance", "operator", "partition"])
         self.operator_latency_gauge = Gauge("operator_latency_ms",
                                             "Average operator call latency in ms for this epoch",
                                             ["instance", "operator", "partition"])
@@ -193,9 +197,9 @@ class CoordinatorService(object):
         self.snapshotting_task: asyncio.Task | None = None
 
         # Phase-attributed resource metrics (aggregated per epoch in the worker, scraped at coordinator).
-        self.phase_cpu_seconds_total = Counter(
-            "phase_cpu_seconds_total",
-            "Process CPU time attributed to a transactional protocol phase (seconds, cumulative)",
+        self.phase_cpu_ms_total = Counter(
+            "phase_cpu_ms_total",
+            "Process CPU time attributed to a transactional protocol phase (ms, cumulative)",
             ["instance", "phase"],
         )
         self.phase_net_rx_bytes_total = Counter(
@@ -439,7 +443,7 @@ class CoordinatorService(object):
                      queue_backlog, idle_time_ms,
                      total_txns, committed_txns, logic_aborts,
                      concurrency_aborts, committed_lock_free,
-                     committed_fallback, empty_epoch, utilization,
+                     committed_fallback, empty_epoch, cpu_utilization, io_wait_utilization,
                      operator_epoch_stats, *rest) = self.protocol_networking.decode_message(data)
                     phase_resources = rest[0] if rest else None
                     
@@ -456,17 +460,18 @@ class CoordinatorService(object):
                     self.latency_breakdown_gauge.labels(instance=worker_id, component="Async Snapshot").set(snap_time)
                     self.backpressure_gauge.labels(instance=worker_id).set(sequencer_backpressure)
                     self.queue_backlog_gauge.labels(instance=worker_id).set(queue_backlog)
-                    self.idle_time_ms_per_second_gauge.labels(instance=worker_id).set(idle_time_ms)
-                    # Transaction count metrics
-                    self.epoch_total_txns_gauge.labels(instance=worker_id).set(total_txns)
-                    self.epoch_committed_txns_gauge.labels(instance=worker_id).set(committed_txns)
-                    self.epoch_logic_aborts_gauge.labels(instance=worker_id).set(logic_aborts)
-                    self.epoch_concurrency_aborts_gauge.labels(instance=worker_id).set(concurrency_aborts)
-                    self.epoch_committed_lock_free_gauge.labels(instance=worker_id).set(committed_lock_free)
-                    self.epoch_committed_fallback_gauge.labels(instance=worker_id).set(committed_fallback)
+                    self.idle_time_ms_gauge.labels(instance=worker_id).set(idle_time_ms)
+                    # Transaction count metrics 
+                    self.epoch_total_txns_counter.labels(instance=worker_id).inc(total_txns)
+                    self.epoch_committed_txns_counter.labels(instance=worker_id).inc(committed_txns)
+                    self.epoch_logic_aborts_counter.labels(instance=worker_id).inc(logic_aborts)
+                    self.epoch_concurrency_aborts_counter.labels(instance=worker_id).inc(concurrency_aborts)
+                    self.epoch_committed_lock_free_counter.labels(instance=worker_id).inc(committed_lock_free)
+                    self.epoch_committed_fallback_counter.labels(instance=worker_id).inc(committed_fallback)
                     # Downscaling metrics
                     self.empty_epoch_gauge.labels(instance=worker_id).set(1 if empty_epoch else 0)
-                    self.utilization_gauge.labels(instance=worker_id).set(utilization)
+                    self.cpu_utilization_ratio_gauge.labels(instance=worker_id).set(cpu_utilization)
+                    self.io_utilization_ratio_gauge.labels(instance=worker_id).set(io_wait_utilization)
                     # Operator-level metrics for this worker and epoch
                     #print(f"Worker {worker_id}, received operator epoch stats: {operator_epoch_stats}")
                     for op_name, partition, tps, avg_latency_ms, call_count in operator_epoch_stats:
@@ -475,8 +480,8 @@ class CoordinatorService(object):
                             "operator": op_name,
                             "partition": str(partition)
                         }
-                        self.operator_tps_gauge.labels(**labels).set(tps)
-                        self.operator_call_count_gauge.labels(**labels).set(call_count)
+                        self.operator_tps_counter.labels(**labels).inc(tps)
+                        self.operator_call_count_counter.labels(**labels).inc(call_count)
                         self.operator_latency_gauge.labels(**labels).set(avg_latency_ms)
 
                     if phase_resources:
@@ -485,7 +490,7 @@ class CoordinatorService(object):
                         tx_bytes = phase_resources.get("tx_bytes", {})
                         rss_max_bytes = phase_resources.get("rss_max_bytes", {})
                         for phase, v in cpu_ns.items():
-                            self.phase_cpu_seconds_total.labels(instance=worker_id, phase=phase).inc(float(v) / 1e9)
+                            self.phase_cpu_ms_total.labels(instance=worker_id, phase=phase).inc(float(v) / 1e6)
                         for phase, v in rx_bytes.items():
                             self.phase_net_rx_bytes_total.labels(instance=worker_id, phase=phase).inc(float(v))
                         for phase, v in tx_bytes.items():
