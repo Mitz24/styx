@@ -42,4 +42,3 @@ class MessageType(IntEnum):
     ReceiveRemoteKey = 37
     AsyncMigration = 38
     MigrationInitDone = 39
-    ManualScale = 50

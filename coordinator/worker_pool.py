@@ -1,7 +1,7 @@
 import asyncio
 import heapq
 import os
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 
 from styx.common.operator import Operator
@@ -43,6 +43,8 @@ class WorkerPool(object):
         self._tombstone = '<removed-worker>'
         # priority queue to be used for roundrobin scheduling
         self._queue: list[list[int | Worker | str]] = []
+        self._standby_queue: deque[Worker] = deque()
+        self._standby_worker_ids: set[int] = set()
         # index is used so that we have deterministic selection when priority is the same
         self._index: int = 0
         # Worker ids start from 1
@@ -53,7 +55,7 @@ class WorkerPool(object):
         self.orphaned_operator_assignments: dict[OperatorPartition, Operator] = {}
 
     def get_live_workers(self) -> list[Worker]:
-        """Returns all currently known (non-tombstoned) workers, including standby ones."""
+        """Returns all currently known (non-tombstoned) workers"""
         live: list[Worker] = []
         for _, _, worker in self._queue:
             if worker == self._tombstone:
@@ -85,7 +87,8 @@ class WorkerPool(object):
     def register_worker(self,
                         worker_ip: str,
                         worker_port: int,
-                        protocol_port: int) -> int:
+                        protocol_port: int,
+                        standby: bool) -> int:
         if self.dead_worker_ids:
             worker_id: int = self.dead_worker_ids.pop()
         else:
@@ -96,12 +99,18 @@ class WorkerPool(object):
                         worker_port=worker_port,
                         protocol_port=protocol_port,
                         assigned_operators={})
-        self.put(worker)
+        if standby:
+            self._standby_queue.append(worker)
+            self._standby_worker_ids.add(worker_id)
+        else:
+            self.put(worker)
         return worker_id
 
     def register_worker_heartbeat(self,
                                   worker_id: int,
                                   heartbeat_time: float):
+        if not self.is_worker_active(worker_id):
+            return
         try:
             self.peek(worker_id).previous_heartbeat = heartbeat_time
         except KeyError:
@@ -187,6 +196,18 @@ class WorkerPool(object):
         worker = entry[-1]
         entry[-1] = self._tombstone
         return worker
+
+    def activate_standby_worker(self) -> Worker:
+        if not self._standby_queue:
+            return None
+        worker: Worker = self._standby_queue.popleft()
+        self._standby_worker_ids.remove(worker.worker_id)
+        self.put(worker)
+        return worker
+
+    def is_worker_active(self, worker_id: int) -> bool:
+        return (worker_id not in self._standby_worker_ids and worker_id not in self.dead_worker_ids 
+            and worker_id in self._worker_queue_idx)
 
     def number_of_workers(self):
         return len(self._queue)

@@ -26,6 +26,7 @@ from coordinator.migration_metadata import MigrationMetadata
 from coordinator.worker_pool import Worker
 from coordinator_metadata import Coordinator
 from aria_sync_metadata import AriaSyncMetadata
+from sliding_window_metric import SlidingWindowMetric
 
 SERVER_PORT = 8888
 PROTOCOL_PORT = 8889
@@ -174,28 +175,6 @@ class CoordinatorService(object):
                                         "Timestamp when the migration completed",
                                         [])
 
-        self.migration_in_progress: bool = False
-
-        self.networking_locks: dict[MessageType, asyncio.Lock] = {
-            MessageType.SendExecutionGraph: asyncio.Lock(),
-            MessageType.MigrationRepartitioningDone: asyncio.Lock(),
-            MessageType.MigrationDone: asyncio.Lock(),
-            MessageType.MigrationInitDone: asyncio.Lock(),
-            MessageType.RegisterWorker: asyncio.Lock(),
-            MessageType.ManualScale: asyncio.Lock(),
-            MessageType.SnapID: asyncio.Lock(),
-            MessageType.Heartbeat: asyncio.Lock(),
-            MessageType.AriaProcessingDone: asyncio.Lock(),
-            MessageType.AriaCommit: asyncio.Lock(),
-            MessageType.AriaFallbackStart: asyncio.Lock(),
-            MessageType.AriaFallbackDone: asyncio.Lock(),
-            MessageType.SyncCleanup: asyncio.Lock(),
-            MessageType.DeterministicReordering: asyncio.Lock(),
-            MessageType.ReadyAfterRecovery: asyncio.Lock()
-        }
-
-        self.snapshotting_task: asyncio.Task | None = None
-
         # Phase-attributed resource metrics (aggregated per epoch in the worker, scraped at coordinator).
         self.phase_cpu_ms_total = Counter(
             "phase_cpu_ms_total",
@@ -217,6 +196,35 @@ class CoordinatorService(object):
             "Max RSS observed during a transactional protocol phase within the last reported epoch (MB)",
             ["instance", "phase"],
         )
+
+        self.migration_in_progress: bool = False
+
+        self.networking_locks: dict[MessageType, asyncio.Lock] = {
+            MessageType.SendExecutionGraph: asyncio.Lock(),
+            MessageType.MigrationRepartitioningDone: asyncio.Lock(),
+            MessageType.MigrationDone: asyncio.Lock(),
+            MessageType.MigrationInitDone: asyncio.Lock(),
+            MessageType.RegisterWorker: asyncio.Lock(),
+            MessageType.SnapID: asyncio.Lock(),
+            MessageType.Heartbeat: asyncio.Lock(),
+            MessageType.AriaProcessingDone: asyncio.Lock(),
+            MessageType.AriaCommit: asyncio.Lock(),
+            MessageType.AriaFallbackStart: asyncio.Lock(),
+            MessageType.AriaFallbackDone: asyncio.Lock(),
+            MessageType.SyncCleanup: asyncio.Lock(),
+            MessageType.DeterministicReordering: asyncio.Lock(),
+            MessageType.ReadyAfterRecovery: asyncio.Lock()
+        }
+
+        self.snapshotting_task: asyncio.Task | None = None
+
+        # Scaling policy parameters
+        self.scale_up_cpu_threshold: float = 75.0
+        self.scale_cooldown_period: float = 10.0
+        self.last_scale_action_time: float = 0.0
+        self.scaled_once: bool = False # TEMPORARY
+        self.scale_window_seconds: int = 5
+        self.cpu_metric_window: SlidingWindowMetric = SlidingWindowMetric(self.scale_window_seconds)
         
     # Refactoring candidate
     async def coordinator_controller(self, transport, data, pool: concurrent.futures.ProcessPoolExecutor):
@@ -247,10 +255,6 @@ class CoordinatorService(object):
                         logging.warning("Another migration request is currently in progress!")
                         return
                     logging.info("Submitted Stateflow Graph to Workers")
-            case MessageType.ManualScale:
-                async with self.networking_locks[message_type]:
-                    (new_n_partitions,) = self.networking.decode_message(data)
-                    await self._handle_manual_scale(int(new_n_partitions))
             case MessageType.MigrationRepartitioningDone:
                 async with self.networking_locks[message_type]:
                     (epoch_counter, t_counter, input_offsets, output_offsets) = self.networking.decode_message(data)
@@ -282,9 +286,9 @@ class CoordinatorService(object):
                         await self.migration_metadata.cleanup(message_type)
             case MessageType.RegisterWorker:  # REGISTER_WORKER
                 async with self.networking_locks[message_type]:
-                    worker_ip, worker_port, protocol_port = self.networking.decode_message(data)
+                    worker_ip, worker_port, protocol_port, standby = self.networking.decode_message(data)
                     # A worker registered to the coordinator
-                    worker_id, init_recovery = self.coordinator.register_worker(worker_ip, worker_port, protocol_port)
+                    worker_id, init_recovery = self.coordinator.register_worker(worker_ip, worker_port, protocol_port, standby)
                     transport.write(self.networking.encode_message(
                         msg=worker_id,
                         msg_type=MessageType.RegisterWorker,
@@ -325,6 +329,7 @@ class CoordinatorService(object):
                     self.network_rx_gauge.labels(instance=worker_id).set(rx_net)  # KB
                     self.network_tx_gauge.labels(instance=worker_id).set(tx_net)  # KB
                     heartbeat_rcv_time = timer()
+                    await self.analyze_scaling_metrics(cpu_perc, worker_id)
                     logging.info(f'Heartbeat received from: {worker_id} at time: {heartbeat_rcv_time}')
                     self.coordinator.register_worker_heartbeat(worker_id, heartbeat_rcv_time)
             case MessageType.ReadyAfterRecovery:
@@ -337,7 +342,7 @@ class CoordinatorService(object):
                 # Any other message type
                 logging.error(f"COORDINATOR SERVER: Non supported message type: {message_type}")
 
-    async def _handle_manual_scale(self, new_n_partitions: int) -> None:
+    async def scale_up(self, new_n_partitions: int, new_worker_num: int) -> None:
         if self.migration_in_progress:
             logging.warning("ManualScale requested but a migration is already in progress.")
             return
@@ -349,6 +354,7 @@ class CoordinatorService(object):
             logging.warning(f"ManualScale requested with invalid new_n_partitions={new_n_partitions}")
             return
 
+        # TODO: Decide how to handle this
         max_parallelism = 10 #int(os.getenv("MAX_OPERATOR_PARALLELISM", 10))
         if new_n_partitions > max_parallelism:
             logging.warning(
@@ -372,15 +378,23 @@ class CoordinatorService(object):
         if self.aria_metadata is not None:
             self.aria_metadata.stop_in_next_epoch()
 
-        # 3) Recompute assignments so standby/new workers become participating
+        # 3) Activate the new workers
+        for _ in range(new_worker_num):
+            worker = self.coordinator.worker_pool.activate_standby_worker()
+            if worker is None:
+                logging.error("No standby workers available to activate")
+                break
+            logging.warning(f"Activated standby worker: {worker.worker_id}")
+
+        # 4) Recompute assignments so standby/new workers become participating
         self.coordinator.reschedule_all_partitions_round_robin(new_graph)
 
-        # 4) Kick off the existing migration pipeline (state repartition + transfer + resume)
+        # 5) Kick off the existing migration pipeline (state repartition + transfer + resume)
         self.migration_metadata = MigrationMetadata(
             len(self.coordinator.worker_pool.get_participating_workers())
         )
         logging.warning(
-            f"MANUAL_SCALE | starting migration | new_n_partitions={new_n_partitions} "
+            f"SCALE_UP | starting migration | new_n_partitions={new_n_partitions} "
             f"workers_live={len(self.coordinator.worker_pool.get_live_workers())} "
             f"workers_participating={len(self.coordinator.worker_pool.get_participating_workers())}"
             f"new graph={new_graph}"
@@ -586,6 +600,23 @@ class CoordinatorService(object):
     def start_networking_tasks(self):
         self.networking.start_networking_tasks()
         self.protocol_networking.start_networking_tasks()
+
+    async def analyze_scaling_metrics(self, cpu_val: float, worker_id: int):
+        if (time.time() - self.last_scale_action_time < self.scale_cooldown_period or self.scaled_once 
+                or not self.coordinator.worker_pool.is_worker_active(worker_id)):
+            return
+        
+        logging.warning(f"Analyzing scaling metrics for CPU value: {cpu_val} and worker: {worker_id}")
+        self.cpu_metric_window.add(cpu_val)
+        avg_cpu = self.cpu_metric_window.average()
+        logging.warning(f"Current average CPU value: {avg_cpu}")
+
+        ## Rolling average of the last self.scale_window_size cpu usage values
+        if avg_cpu and avg_cpu > self.scale_up_cpu_threshold:
+            logging.warning(f"Scaling up for worker: {worker_id}")
+            self.scaled_once = True
+            self.last_scale_action_time = time.time()
+            await self.scale_up(2, 1)
 
     async def finalize_migration_repartition(self):
         async with asyncio.TaskGroup() as tg:

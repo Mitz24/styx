@@ -66,10 +66,10 @@ class Coordinator(object):
                 continue
             break
 
-    def register_worker(self, worker_ip: str, worker_port: int, protocol_port: int) -> tuple[int, bool]:
+    def register_worker(self, worker_ip: str, worker_port: int, protocol_port: int, standby: bool) -> tuple[int, bool]:
         worker_key = (worker_ip, worker_port, protocol_port)
         if worker_key not in self.worker_ip_to_id:
-            worker_id = self.worker_pool.register_worker(worker_ip, worker_port, protocol_port)
+            worker_id = self.worker_pool.register_worker(worker_ip, worker_port, protocol_port, standby)
             self.worker_ip_to_id[worker_key] = worker_id
             init_recovery: bool = False
         else:

@@ -33,7 +33,6 @@ class MetadataParams:
     migration_start_time: float
     migration_end_time: float
     zipf_const: Optional[float] = None
-    manual_scale_sec: Optional[int] = None
     interval_seconds: Optional[int] = None
     delta_tps: Optional[int] = None
     n_threads: int = 1
@@ -68,49 +67,7 @@ def save_metadata(params: MetadataParams):
         metadata["increase_interval"] = params.interval_seconds
     if params.delta_tps is not None:
         metadata["increase_amount"] = params.delta_tps
-    if params.manual_scale_sec is not None:
-        metadata["manual_scale_sec"] = params.manual_scale_sec
 
     metadata["n_threads"] = params.n_threads
 
     save_data(metadata, params.out_path, "metadata.json")
-
-
-def export_all_metrics(workload, start, end, step, out_path, n_partitions, messages_per_second):
-    metric_set = {
-        "latency": "avg by(instance) (worker_cpu_usage_percent)",
-        "memory": "avg by(instance) (worker_memory_usage_mb) * 1000000",
-        "throughput": f"sum(rate(worker_epoch_throughput_tps[{step}]))",
-        "latency_breakdown": "avg(latency_breakdown) by (component)",
-        "transaction_latency": "avg(worker_epoch_latency_ms)",
-        "snapshotting_time": "avg(worker_total_snapshotting_time_ms)",
-        "backpressure": "sum(worker_backpressure)",
-        "queue_backlog": "sum(queue_backlog)",
-    }
-
-    timestamp = datetime.now().strftime("%m%d_%H%M")
-    save_dir = os.path.join(
-        out_path, f"{workload}_{messages_per_second}tps_{n_partitions}partitions_{timestamp}"
-    )
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-
-    print(f"Exporting metrics to {save_dir}")
-    for metric_name, metric_query in metric_set.items():
-        data = get_metric_data(metric_query, start, end, step)
-        with open(os.path.join(save_dir, f"{metric_name}.json"), "w") as f:
-            json.dump(data, f, indent=2)
-
-
-def get_metric_data(query, start, end, step):
-    resp = requests.get(
-        f"{PROM}/api/v1/query_range",
-        params={
-            "query": query,
-            "start": start,
-            "end": end,
-            "step": step,
-        },
-    )
-    resp.raise_for_status()
-    return resp.json()

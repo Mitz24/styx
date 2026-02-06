@@ -426,7 +426,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "avg by(instance) (worker_cpu_usage_percent)",
+          "expr": "avg by(instance) (worker_cpu_usage_percent > 0)",
           "range": true,
           "refId": "A"
         }
@@ -1495,8 +1495,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "red",
@@ -1591,8 +1590,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "red",
@@ -1691,8 +1689,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "red",
@@ -1786,8 +1783,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "orange",
@@ -1899,8 +1895,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "orange",
@@ -1986,8 +1981,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "red",
@@ -2086,8 +2080,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "red",
@@ -2146,8 +2139,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
-                "value": null
+                "color": "green"
               },
               {
                 "color": "orange",
@@ -2231,6 +2223,6 @@
   "timezone": "browser",
   "title": "Styx System Overview",
   "uid": "beckc0nxpeupsf",
-  "version": 3,
+  "version": 4,
   "weekStart": ""
 }

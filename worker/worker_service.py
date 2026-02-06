@@ -732,10 +732,10 @@ class Worker(object):
         self.networking.start_networking_tasks()
         self.protocol_networking.start_networking_tasks()
 
-    async def register_to_coordinator(self):
+    async def register_to_coordinator(self, standby: bool):
         self.id = await self.networking.send_message_request_response(
             DISCOVERY_HOST, DISCOVERY_PORT,
-            msg=(self.networking.host_name, self.server_port, self.protocol_port),
+            msg=(self.networking.host_name, self.server_port, self.protocol_port, standby),
             msg_type=MessageType.RegisterWorker,
             serializer=Serializer.MSGPACK
         )
@@ -761,9 +761,9 @@ class Worker(object):
     def start_heartbeat_process(self, worker_id: int, worker_pid: int):
         uvloop.run(self.heartbeat_coroutine(worker_id, worker_pid))
 
-    async def main(self):
+    async def main(self, standby: bool):
         try:
-            await self.register_to_coordinator()
+            await self.register_to_coordinator(standby)
             worker_pid: int = os.getpid()
             self.heartbeat_proc = multiprocessing.Process(
                 target=self.start_heartbeat_process,

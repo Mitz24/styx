@@ -52,7 +52,6 @@ if not os.path.exists(SAVE_DIR):
 warmup_seconds: int = int(sys.argv[8])
 run_with_validation = sys.argv[9].lower() == "true"
 epoch_size = int(sys.argv[10])
-manual_scale_time = int(sys.argv[11])
 
 ####################################################################################################################
 g = StateflowGraph('ycsb-benchmark', operator_state_backend=LocalStateBackend.DICT)
@@ -129,9 +128,6 @@ def benchmark_runner(proc_num) -> dict[bytes, dict]:
                 time.sleep(1 - lps)
             sec_end2 = timer()
             print(f'{sec} | Latency per second: {sec_end2 - sec_start}')
-            if sec == manual_scale_time:
-                styx.submit_manual_scale(N_PARTITIONS + 1)
-                print(f'Manual scale request submitted for: {N_PARTITIONS + 1} partitions')
         end = timer()
         print(f'Average latency per second: {(end - start) / seconds}')
 
@@ -227,6 +223,5 @@ if __name__ == "__main__":
             zipf_const=ZIPF_CONST,
             epoch_size=epoch_size,
             warmup_seconds=warmup_seconds,
-            manual_scale_sec=manual_scale_time,
         )
     )

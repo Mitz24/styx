@@ -68,7 +68,7 @@ services:
   worker-standby:
     build:
       context: .
-      dockerfile: worker/standby.dockerfile
+      dockerfile: worker/worker.dockerfile
     image: dev/styx-worker-standby:latest
     environment:
       - INGRESS_TYPE=KAFKA
@@ -76,6 +76,7 @@ services:
       - DISCOVERY_HOST=coordinator
       - DISCOVERY_PORT=8888
       - STYX_START_FILE=/tmp/styx_start
+      - WORKER_STANBY=true
     env_file:
       - env/minio.env
     depends_on:

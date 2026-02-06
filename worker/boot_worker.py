@@ -13,14 +13,16 @@ DEBUGPY_HOST: str = os.getenv("STYX_DEBUGPY_HOST", "0.0.0.0")
 DEBUGPY_BASE_PORT: int = int(os.getenv("STYX_DEBUGPY_BASE_PORT", "5678"))
 DEBUGPY_WAIT: bool = os.getenv("STYX_DEBUGPY_WAIT", "1").lower() in ("1", "true", "yes", "y")
 
+WORKER_STANBY: bool = os.getenv("WORKER_STANBY", "false").lower() == "true"
 
 class BootStyx(object):
 
     def __init__(self):
+        self.standby = WORKER_STANBY
         self.worker_threads_pool: list[multiprocessing.Process] = []
 
     @staticmethod
-    def start_worker_thread(thread_idx: int):
+    def start_worker_thread(thread_idx: int, standby: bool = False):
         # NOTE: this runs in a separate OS process (multiprocessing.Process).
         # If you want breakpoints in worker code, you need to start debugpy in *this* process.
         if DEBUGPY_ENABLED:
@@ -39,14 +41,14 @@ class BootStyx(object):
                 # (e.g. image not rebuilt with debugpy installed)
                 print(f"[debugpy] failed to start on thread_idx={thread_idx}: {e}", flush=True)
         worker = Worker(thread_idx)
-        uvloop.run(worker.main())
+        uvloop.run(worker.main(standby))
 
     def main(self):
         for thread_idx in range(N_THREADS):
             self.worker_threads_pool.append(
                 multiprocessing.Process(
                     target=self.start_worker_thread,
-                    args=(thread_idx, )
+                    args=(thread_idx, self.standby, )
                 )
             )
         for worker_thread in self.worker_threads_pool:
