@@ -26,6 +26,7 @@ from tqdm import tqdm
 from ycsb import ycsb_operator
 from zipfian_generator import ZipfGenerator
 
+from codecarbon import EmissionsTracker
 
 threads = int(sys.argv[1])
 barrier = multiprocessing.Barrier(threads)
@@ -53,6 +54,7 @@ warmup_seconds: int = int(sys.argv[8])
 run_with_validation = sys.argv[9].lower() == "true"
 epoch_size = int(sys.argv[10])
 
+tracker = EmissionsTracker(project_name="styx-autoscale-YCSB-T", output_file=f'{SAVE_DIR}/emissions.csv')
 ####################################################################################################################
 g = StateflowGraph('ycsb-benchmark', operator_state_backend=LocalStateBackend.DICT)
 ycsb_operator.set_n_partitions(N_PARTITIONS)
@@ -189,6 +191,7 @@ def main():
 
 
 if __name__ == "__main__":
+    tracker.start()
     start_time = time.time()
     main()
     end_time = time.time()
@@ -196,6 +199,7 @@ if __name__ == "__main__":
     print()
     kafka_output_consumer.main(SAVE_DIR)
 
+    tracker.stop()
     print()
     calculate_metrics.main(
         N_ENTITIES,

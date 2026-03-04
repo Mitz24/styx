@@ -30,8 +30,8 @@ class MetadataParams:
     seconds: int
     epoch_size: int
     warmup_seconds: int
-    migration_start_time: float
-    migration_end_time: float
+    migration_start_time: Optional[float] = None
+    migration_end_time: Optional[float] = None
     zipf_const: Optional[float] = None
     interval_seconds: Optional[int] = None
     delta_tps: Optional[int] = None
@@ -58,8 +58,8 @@ def save_metadata(params: MetadataParams):
         "duration (s)": params.seconds, 
         "epoch_size": params.epoch_size,
         "warmup_seconds": params.warmup_seconds,
-        "migration_start_time": params.migration_start_time,
-        "migration_end_time": params.migration_end_time,
+        "migration_start_time": params.migration_start_time if params.migration_start_time is not None else None,
+        "migration_end_time": params.migration_end_time if params.migration_end_time is not None else None,
     }
     if params.zipf_const is not None:
         metadata["zipf_const"] = params.zipf_const

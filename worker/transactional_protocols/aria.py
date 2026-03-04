@@ -331,7 +331,7 @@ class AriaProtocol(BaseTransactionalProtocol):
     async def _handle_run_fun_remote(self, data: bytes) -> None:
         mt = MessageType.RunFunRemote
         async with self.networking_locks[mt]:
-            logging.debug("CALLED RUN FUN FROM PEER")
+            #logging.debug("CALLED RUN FUN FROM PEER")
             (
                 t_id,
                 request_id,
@@ -379,8 +379,8 @@ class AriaProtocol(BaseTransactionalProtocol):
                 params,
             ) = self.networking.decode_message(data)
 
-            logging.debug(
-                f"Aria WrongPartitionRequest: {key}:{operator_name}:{kafka_ingress_partition}",
+            logging.warning(
+                f"Aria WrongPartitionRequest: {key}:{operator_name}:{kafka_ingress_partition} and partition {partition}",
             )
 
             payload = RunFuncPayload(
@@ -494,7 +494,7 @@ class AriaProtocol(BaseTransactionalProtocol):
 
         async with self.networking_locks[mt]:
             self.local_state.set_batch_data_from_migration(operator_partition, batch)
-        
+
 
     async def _write_to_wal(self, sequence: list[SequencedItem]) -> tuple[float, float]:
         start_wal = timer()
@@ -566,6 +566,8 @@ class AriaProtocol(BaseTransactionalProtocol):
     async def _process_epoch(self, sequence: list[SequencedItem]) -> None:
         epoch_start = timer()
 
+        sequence = await self._redirect_migration_backlog_transactions(sequence)
+
         # Calculate idle time: time spent waiting since last epoch ended
         idle_end = timer()
         idle_start = self._last_epoch_end_time if self._last_epoch_end_time else idle_end
@@ -586,7 +588,7 @@ class AriaProtocol(BaseTransactionalProtocol):
         # Capture LOCAL logic aborts before sync overwrites with global
         logic_aborts_count = len(self.networking.logic_aborts_everywhere)
         sync_time += await self._sync_processing_done()
-        logging.debug(f"Finished syncing processing")
+        logging.debug("Finished syncing processing")
 
         conflict_resolution_start = timer()
         self.phase_resource_tracker.begin("Conflict Resolution")
@@ -597,12 +599,12 @@ class AriaProtocol(BaseTransactionalProtocol):
         concurrency_aborts = await self._compute_concurrency_aborts()
         self.phase_resource_tracker.end("Conflict Resolution")
         conflict_resolution_end = timer()
-        logging.debug(f"Finished conflict resolution")
+        logging.debug("Finished conflict resolution")
         local_abort_rate = (len(concurrency_aborts) / len(sequence)) if sequence else 0.0
 
         # Notify peers that we are ready to commit
         sync_time += await self._sync_commit(sequence, concurrency_aborts)
-        logging.debug(f"Finished syncing commit")
+        logging.debug("Finished syncing commit")
         # HERE WE KNOW ALL THE CONCURRENCY ABORTS
         commit_start = timer()
         self.phase_resource_tracker.begin("Commit time")
@@ -610,7 +612,7 @@ class AriaProtocol(BaseTransactionalProtocol):
         await self.send_delta_to_snapshotting_proc()
         self.phase_resource_tracker.end("Commit time")
         commit_end = timer()
-        logging.debug(f"Finished commit")
+        logging.debug("Finished commit")
         # Track lock-free vs fallback commits
         local_concurrency_aborted = {
             seq_i.t_id for seq_i in sequence if seq_i.t_id in self.concurrency_aborts_everywhere
@@ -623,7 +625,7 @@ class AriaProtocol(BaseTransactionalProtocol):
         abort_rate, committed_fallback = await self._maybe_run_fallback()
         self.phase_resource_tracker.end("Fallback")
         fallback_end = timer()
-        logging.debug(f"Finished fallback")
+        logging.debug("Finished fallback")
         self._advance_offsets(sequence)
 
         self.sequencer.increment_epoch(self.max_t_counter, self.t_ids_to_reschedule)
@@ -738,6 +740,63 @@ class AriaProtocol(BaseTransactionalProtocol):
         await self._sync_cleanup(worker_epoch_stats)
         self._last_epoch_end_time = timer()
 
+    """ When migration happens, the transactions that are in the backlog of the migration need to be redirected to the new partition.
+    If the key is in the set_keys_to_send and the partition is not the same as the new partition, the transaction needs to be redirected
+    to the new partition decided by the previous migration.
+    """
+    async def _redirect_migration_backlog_transactions(self, sequence: list[SequencedItem]) -> list[SequencedItem]:
+        sequence_to_process = []
+        for seq_item in sequence:
+    
+            if seq_item.payload.key in self.local_state.set_keys_to_send and seq_item.payload.partition != self.local_state.keys_to_workers[seq_item.payload.key]:
+                new_partition = self.local_state.keys_to_workers[seq_item.payload.key]
+                logging.warning(
+                    f"Key {seq_item.payload.key} needs redirect: "
+                    f"partition {seq_item.payload.partition} -> {new_partition}"
+                )
+                operator_name = seq_item.payload.operator_name
+                operator_host = self.dns[operator_name][new_partition][0]
+                operator_port = self.dns[operator_name][new_partition][2]
+
+                if self.networking.in_the_same_network(operator_host, operator_port):
+                    # Internal transfer within the same worker: re-sequence with corrected partition
+                    corrected_payload = RunFuncPayload(
+                        request_id=seq_item.payload.request_id,
+                        key=seq_item.payload.key,
+                        operator_name=operator_name,
+                        partition=new_partition,
+                        function_name=seq_item.payload.function_name,
+                        params=seq_item.payload.params,
+                        kafka_ingress_partition=seq_item.payload.kafka_ingress_partition,
+                        kafka_offset=seq_item.payload.kafka_offset,
+                    )
+                    self.sequencer.sequence(corrected_payload)
+                else:
+                    # Forward to remote worker
+                    # Handler expects tuple: (request_id, operator_name, function_name, key,
+                    # partition, kafka_ingress_partition, kafka_offset, params)
+                    payload = (
+                        seq_item.payload.request_id,
+                        operator_name,
+                        seq_item.payload.function_name,
+                        seq_item.payload.key,
+                        new_partition,
+                        seq_item.payload.kafka_ingress_partition,
+                        seq_item.payload.kafka_offset,
+                        seq_item.payload.params,
+                    )
+                    await self.networking.send_message(
+                        operator_host,
+                        operator_port,
+                        msg=payload,
+                        msg_type=MessageType.WrongPartitionRequest,
+                        serializer=Serializer.MSGPACK,
+                    )
+            else:
+                sequence_to_process.append(seq_item)
+        return sequence_to_process
+
+
     async def _run_epoch_functions_and_chain(
         self,
         sequence: list[SequencedItem],
@@ -766,8 +825,8 @@ class AriaProtocol(BaseTransactionalProtocol):
         )
         end_chain = timer()
         self.phase_resource_tracker.end("Chain Acks")
-        logging.debug(f"Finished waiting on chained functions")
-        
+        logging.debug("Finished waiting on chained functions")
+
         return {
             "wal_ms": (end_wal - start_wal) * 1000,
             "func_ms": (end_func - start_func) * 1000,
@@ -894,7 +953,7 @@ class AriaProtocol(BaseTransactionalProtocol):
 
             logging.debug(
                 f"FALLBACK_ENTER to_reschedule={len(self.t_ids_to_reschedule)}",
-            )   
+            )
             await self.run_fallback_strategy()
             logging.debug("FALLBACK_AFTER_STRATEGY")
             await self.send_delta_to_snapshotting_proc()
@@ -902,7 +961,7 @@ class AriaProtocol(BaseTransactionalProtocol):
             self.concurrency_aborts_everywhere = set()
             self.t_ids_to_reschedule = set()
         else:
-            logging.debug("FALLBACK_SKIPPED")
+            logging.warning("FALLBACK_SKIPPED")
         return abort_rate, committed_fallback
 
     def _advance_offsets(self, sequence: list[SequencedItem]) -> None:
@@ -1035,7 +1094,7 @@ class AriaProtocol(BaseTransactionalProtocol):
                 )
 
     async def run_fallback_strategy(self) -> None:
-        logging.debug("Starting fallback strategy...") 
+        logging.debug("Starting fallback strategy...")
         (self.waiting_on_transactions, self.fallback_locking_event_map) = self.local_state.get_dep_transactions(
             self.t_ids_to_reschedule
         )

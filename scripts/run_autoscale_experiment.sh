@@ -16,6 +16,7 @@ enable_compression=${12}
 use_composite_keys=${13}
 use_fallback_cache=${14}
 regenerate_tpcc_data=${15:-false}
+kill_at="-1" 
 
 echo "============= Running Experiment ================="
 echo "workload_name: $workload_name"
@@ -38,11 +39,16 @@ echo "=================================================="
 bash scripts/start_styx_cluster.sh "$n_part" "$epoch_size" "$(($n_part + 1))" "$styx_threads_per_worker" "$enable_compression" "$use_composite_keys" "$use_fallback_cache"
 sleep 10
 
-if [[ $workload_name == "scale_test" ]]; then
+docker compose up --scale worker-standby=1 -d worker-standby >/dev/null
+
+if [[ $workload_name == "ycsb" ]]; then
     # YCSB-T
     run_with_validation=false
-    docker compose up --scale worker-standby=1 -d worker-standby >/dev/null
     python demo/demo-ycsb/scale_client.py "$client_threads" "$n_keys" "$n_part" "$zipf_const" "$input_rate" "$total_time" "$saving_dir" "$warmup_seconds" "$run_with_validation" "$epoch_size"
+elif [[ $workload_name == "dhr" ]]; then
+    python demo/demo-deathstar-hotel-reservation/pure_kafka_demo.py "$saving_dir" "$client_threads" "$n_part" "$input_rate" "$total_time" "$warmup_seconds" "$epoch_size" "$kill_at"
+elif [[ $workload_name == "dmr" ]]; then
+    python demo/demo-deathstar-movie-review/pure_kafka_demo.py "$saving_dir" "$client_threads" "$n_part" "$input_rate" "$total_time" "$warmup_seconds" "$epoch_size" "$kill_at"
 else
     echo "Benchmark not supported!"
 fi

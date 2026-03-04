@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euo pipefail
+set -eo pipefail
 
 styx_threads_per_worker=1
 enable_compression=true

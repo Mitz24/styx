@@ -29,9 +29,19 @@ class InMemoryOperatorState(BaseAriaState):
         # (operator_name, old_partition): set of keys with the new partition
         self.keys_to_send: dict[OperatorPartition, set[tuple[K, int]]] = {}
         self.keys_sent: dict[K, int] = {}
+        # Used to efficiently check if a key no longer should be in this worker due to migration 
+        self.set_keys_to_send: set[K] = set()
+        self.keys_to_workers: dict[K, int] = {}
 
     def add_keys_to_send(self, keys_to_send: dict[OperatorPartition, K]) -> None:
         self.keys_to_send = keys_to_send
+        self.set_keys_to_send = set()
+        self.keys_to_workers = {}
+
+        for _, key_set in self.keys_to_send.items():
+            for key, new_partition in key_set:
+                self.set_keys_to_send.add(key)
+                self.keys_to_workers[key] = new_partition
 
     def has_keys_to_send(self) -> bool:
         return bool(self.keys_to_send)

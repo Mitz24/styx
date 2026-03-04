@@ -264,7 +264,7 @@ class Worker:
             e_wire = timer()
             return e_wire - s_wire
 
-        sync_logging.warning(f"New partitions: {new_partitions}")
+        #sync_logging.warning(f"New partitions: {new_partitions}")
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             futures = []
             for n_op, data in new_partitions.items():
@@ -460,7 +460,7 @@ class Worker:
             logging.warning(
                 f"Worker: {self.id} | Migration took: {round((end_time - start_time) * 1000, 4)}ms",
             )
-        except Exception as e:
+        except Exception:
             logging.exception("Uncaught exception while migrating")
 
     async def _migration_stop_protocol(self) -> None:
