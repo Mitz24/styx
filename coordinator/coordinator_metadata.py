@@ -1,6 +1,5 @@
 import asyncio
 from copy import deepcopy
-import io
 import os
 from typing import TYPE_CHECKING
 
@@ -25,11 +24,10 @@ from worker_pool import Worker, WorkerPool
 if TYPE_CHECKING:
     import concurrent.futures
 
-    from minio import Minio
+    from botocore.client import BaseClient as S3Client
     from styx.common.tcp_networking import NetworkingManager
     from styx.common.types import OperatorPartition
 
-MAX_OPERATOR_PARALLELISM = int(os.getenv("MAX_OPERATOR_PARALLELISM", "10"))
 KAFKA_REPLICATION_FACTOR = int(os.getenv("KAFKA_REPLICATION_FACTOR", "3"))
 SNAPSHOT_BUCKET_NAME: str = os.getenv("SNAPSHOT_BUCKET_NAME", "styx-snapshots")
 COMPACT_SNAPSHOTS: bool = bool(strtobool(os.getenv("COMPACT_SNAPSHOTS", "false")))
@@ -37,9 +35,9 @@ KAFKA_URL: str = os.getenv("KAFKA_URL", None)
 
 
 class Coordinator:
-    def __init__(self, networking: NetworkingManager, minio_client: Minio) -> None:
+    def __init__(self, networking: NetworkingManager, s3_client: S3Client) -> None:
         self.networking = networking
-        self.minio_client = minio_client
+        self.s3_client = s3_client
         self.graph_submitted: bool = False
         self.prev_completed_snapshot_id: int = -1
         self.completed_input_offsets: dict[OperatorPartition, int] = {}
@@ -54,6 +52,7 @@ class Coordinator:
         self.worker_ip_to_id: dict[tuple[str, int, int], int] = {}
 
         self.kafka_metadata_producer: AIOKafkaProducer | None = None
+        self.max_operator_parallelism: int | None = None
 
     async def start_kafka_metadata_producer(self) -> None:
         self.kafka_metadata_producer = AIOKafkaProducer(
@@ -195,7 +194,7 @@ class Coordinator:
         current_completed_snapshot: int = self.get_current_completed_snapshot_id()
         if current_completed_snapshot != self.prev_completed_snapshot_id:
             logging.warning(f"Cluster completed snapshot: {current_completed_snapshot}")
-            # if we reached a complete snapshot we could compact its deltas with the previous one
+            # if we reached a complete snapshot, we could compact its deltas with the previous one
             sn_data: bytes = zstd_msgpack_serialization(
                 (
                     self.completed_input_offsets,
@@ -204,11 +203,10 @@ class Coordinator:
                     self.completed_t_counter,
                 ),
             )
-            self.minio_client.put_object(
-                SNAPSHOT_BUCKET_NAME,
-                f"sequencer/{current_completed_snapshot}.bin",
-                io.BytesIO(sn_data),
-                len(sn_data),
+            self.s3_client.put_object(
+                Bucket=SNAPSHOT_BUCKET_NAME,
+                Key=f"sequencer/{current_completed_snapshot}.bin",
+                Body=sn_data,
             )
             self.prev_completed_snapshot_id = current_completed_snapshot
             if COMPACT_SNAPSHOTS:
@@ -230,7 +228,7 @@ class Coordinator:
         # TODO the cluster was balanced by the previous deployment, if the graph is complex it might be
         #  unbalanced after the update
         for _, operator in iter(new_stateflow_graph):
-            for partition in range(MAX_OPERATOR_PARALLELISM):
+            for partition in range(self.max_operator_parallelism):
                 operator_copy = deepcopy(operator)
                 # Partitions are [0, n_partitions). Everything >= n_partitions is a shadow partition.
                 if partition >= operator.n_partitions:
@@ -279,7 +277,7 @@ class Coordinator:
 
         self.worker_pool.reset_all_assignments()
         for operator_name, operator in iter(stateflow_graph):
-            for partition in range(MAX_OPERATOR_PARALLELISM):
+            for partition in range(self.max_operator_parallelism):
                 operator_copy = deepcopy(operator)
                 if partition >= operator.n_partitions:
                     operator_copy.make_shadow()
@@ -290,10 +288,11 @@ class Coordinator:
     ) -> None:
         if not isinstance(stateflow_graph, StateflowGraph):
             raise NotAStateflowGraphError
+        self.max_operator_parallelism = stateflow_graph.max_operator_parallelism
         if ingress_type == IngressTypes.KAFKA:
             await self.create_kafka_ingress_topics(stateflow_graph)
         for operator_name, operator in iter(stateflow_graph):
-            for partition in range(MAX_OPERATOR_PARALLELISM):
+            for partition in range(self.max_operator_parallelism):
                 operator_copy = deepcopy(operator)
                 # Also add the shadow partitions n_partitions - max parallelism
                 #if partition >= operator.n_partitions:
@@ -302,7 +301,6 @@ class Coordinator:
                     (operator_name, partition),
                     operator_copy,
                 )
-
         worker_assignments = self.worker_pool.get_worker_assignments()
         tasks = [
             self.networking.send_message(
@@ -368,7 +366,6 @@ class Coordinator:
                     f"Kafka at {KAFKA_URL} not ready yet, sleeping for 1 second",
                 )
                 await asyncio.sleep(1)
-        logging.warning(f"MAX OPERATOR PARALLELISM: {MAX_OPERATOR_PARALLELISM}")
 
         topics = (
             [
@@ -388,7 +385,7 @@ class Coordinator:
             + [
                 NewTopic(
                     topic=operator.name,
-                    num_partitions=MAX_OPERATOR_PARALLELISM,
+                    num_partitions=self.max_operator_parallelism,
                     replication_factor=KAFKA_REPLICATION_FACTOR,
                 )
                 for operator in stateflow_graph.nodes.values()
@@ -396,7 +393,7 @@ class Coordinator:
             + [
                 NewTopic(
                     topic=operator.name + "--OUT",
-                    num_partitions=MAX_OPERATOR_PARALLELISM,
+                    num_partitions=self.max_operator_parallelism,
                     replication_factor=KAFKA_REPLICATION_FACTOR,
                 )
                 for operator in stateflow_graph.nodes.values()
@@ -408,7 +405,7 @@ class Coordinator:
             try:
                 future.result()
                 logging.warning(
-                    f"Topic {topic} created with {MAX_OPERATOR_PARALLELISM} partitions "
+                    f"Topic {topic} created with {self.max_operator_parallelism} partitions "
                     f"and replication factor of {KAFKA_REPLICATION_FACTOR}",
                 )
             except KafkaException as e:

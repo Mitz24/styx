@@ -9,6 +9,7 @@ import gc
 import logging as sync_logging
 import multiprocessing
 import os
+import random
 import socket
 import struct
 import sys
@@ -30,7 +31,6 @@ import contextlib
 
 from aiokafka import AIOKafkaConsumer, TopicPartition
 from aiokafka.errors import KafkaConnectionError, UnknownTopicOrPartitionError
-from minio import Minio
 from styx.common.local_state_backends import LocalStateBackend
 from styx.common.logging import logging
 from styx.common.message_types import MessageType
@@ -41,7 +41,7 @@ from styx.common.util.aio_task_scheduler import AIOTaskScheduler
 import uvloop
 
 from worker.async_snapshotting import AsyncSnapshottingProcess
-from worker.fault_tolerance.async_snapshots import AsyncSnapshotsMinio
+from worker.fault_tolerance.async_snapshots import AsyncSnapshotsS3
 from worker.operator_state.aria.in_memory_state import InMemoryOperatorState
 from worker.operator_state.stateless import Stateless
 from worker.transactional_protocols.aria import AriaProtocol
@@ -54,9 +54,6 @@ DISCOVERY_HOST: str = os.environ["DISCOVERY_HOST"]
 DISCOVERY_PORT: int = int(os.environ["DISCOVERY_PORT"])
 INGRESS_TYPE = os.getenv("INGRESS_TYPE", None)
 
-MINIO_URL: str = f"{os.environ['MINIO_HOST']}:{os.environ['MINIO_PORT']}"
-MINIO_ACCESS_KEY: str = os.environ["MINIO_ROOT_USER"]
-MINIO_SECRET_KEY: str = os.environ["MINIO_ROOT_PASSWORD"]
 KAFKA_URL: str = os.environ["KAFKA_URL"]
 HEARTBEAT_INTERVAL: int = int(os.getenv("HEARTBEAT_INTERVAL", "500"))  # 500ms
 SNAPSHOT_BUCKET_NAME: str = os.getenv("SNAPSHOT_BUCKET_NAME", "styx-snapshots")
@@ -70,7 +67,6 @@ PROTOCOL_WORKERS: int = int(os.getenv("PROTOCOL_WORKERS", "100"))
 PROTOCOL = Protocols.Aria
 
 # TODO Check dynamic r/w sets
-# TODO networking can take a lot of optimization (i.e., batching, backpreasure e.t.c.)
 # TODO when compactions happen recovery should hold and vice versa
 
 
@@ -144,17 +140,10 @@ class Worker:
         self.aio_task_scheduler = AIOTaskScheduler()
         self.protocol_task_scheduler = AIOTaskScheduler()
 
-        self.async_snapshots: AsyncSnapshotsMinio | None = None
+        self.async_snapshots: AsyncSnapshotsS3 | None = None
         self.protocol_task: asyncio.Task | None = None
 
         self.worker_operators: dict[OperatorPartition, Operator] | None = None
-
-        self.minio_client: Minio = Minio(
-            MINIO_URL,
-            access_key=MINIO_ACCESS_KEY,
-            secret_key=MINIO_SECRET_KEY,
-            secure=False,
-        )
 
         self.migration_repartitioning_done: asyncio.Event = asyncio.Event()
         self.migration_completed: asyncio.Event = asyncio.Event()
@@ -196,6 +185,7 @@ class Worker:
 
         self._message_handlers: dict[MessageType, Callable[[bytes, MessageType], Awaitable[None]]] = {
             MessageType.ReceiveExecutionPlan: self._handle_receive_execution_plan,
+            MessageType.UpdateExecutionGraph: self._handle_update_execution_plan,
             MessageType.InitMigration: self._handle_init_migration,
             MessageType.ReceiveMigrationHashes: self._handle_receive_migration_hashes,
             MessageType.RequestRemoteKey: self._handle_request_remote_key,
@@ -381,19 +371,20 @@ class Worker:
         self._update_peers(peers)
         self._build_registered_operators(self.worker_operators)
 
-        self.async_snapshots = AsyncSnapshotsMinio(
+        self.async_snapshots = AsyncSnapshotsS3(
             self.id,
             n_assigned_partitions=len(self.registered_operators),
         )
 
         await self._send_snap_assigned(snapshot_id=snapshot_id)
 
+        logging.warning("Retrieving Snapshot from S3")
         (snap_data, _in_off, _out_off, epoch, t_counter) = self.async_snapshots.retrieve_snapshot(
             snapshot_id,
             self.registered_operators.keys(),
         )
         self.attach_state_to_operators_after_snapshot(snap_data)
-
+        logging.warning("State attached to operators")
         self.function_execution_protocol = AriaProtocol(
             worker_id=self.id,
             peers=self.peers,
@@ -406,8 +397,13 @@ class Worker:
             epoch_counter=epoch,
             t_counter=t_counter,
         )
+        logging.warning("Starting Function Execution Protocol")
         self.function_execution_protocol.start()
         self.function_execution_protocol.started.set()
+
+    async def _handle_update_execution_plan(self, data: bytes, _: MessageType) -> None:
+        # TODO add code
+        logging.warning("Graph code updates not implemented yet! %s", data)
 
     async def _handle_init_migration(self, data: bytes, _: MessageType) -> None:
         try:
@@ -560,7 +556,7 @@ class Worker:
 
         # Update snapshot helper
         if self.async_snapshots is None:
-            self.async_snapshots = AsyncSnapshotsMinio(self.id, n_assigned_partitions=len(self.registered_operators))
+            self.async_snapshots = AsyncSnapshotsS3(self.id, n_assigned_partitions=len(self.registered_operators))
         else:
             self.async_snapshots.update_n_assigned_partitions(n_assigned_partitions=len(self.registered_operators))
 
@@ -715,7 +711,7 @@ class Worker:
 
         self._build_registered_operators(self.worker_operators)
 
-        self.async_snapshots = AsyncSnapshotsMinio(
+        self.async_snapshots = AsyncSnapshotsS3(
             self.id,
             n_assigned_partitions=len(self.registered_operators),
         )
@@ -955,21 +951,73 @@ class Worker:
         async with server:
             await server.serve_forever()
 
-    def start_networking_tasks(self) -> None:
-        self.networking.start_networking_tasks()
-        self.protocol_networking.start_networking_tasks()
-
     async def register_to_coordinator(self, standby: bool) -> None:
-        self.id = await self.networking.send_message_request_response(
-            DISCOVERY_HOST,
-            DISCOVERY_PORT,
-            msg=(self.networking.host_name, self.server_port, self.protocol_port, standby),
-            msg_type=MessageType.RegisterWorker,
-            serializer=Serializer.MSGPACK,
-        )
-        logging.warning(f"Worker id received from coordinator: {self.id}")
-        self.protocol_networking.set_worker_id(self.id)
-        self.networking.set_worker_id(self.id)
+        """
+        Production-grade retry:
+          - Exponential backoff with full jitter
+          - Optional infinite retries (recommended for bootstrapping)
+          - Cancellation-aware (won't swallow CancelledError)
+          - Caps backoff to avoid unbounded sleeps
+          - Logs with attempt counters and next delay
+        """
+
+        # ---- policy knobs  ----
+        infinite_retries: bool = True  # for worker bootstrapping this is often correct
+        max_retries: int = 30  # used only if infinite_retries=False
+        base_delay_s: float = 0.5  # initial backoff
+        max_delay_s: float = 30.0  # cap backoff
+        timeout_s: float | None = 5.0  # per-attempt timeout; set None to disable
+        # -----------------------
+
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                coro = self.networking.send_message_request_response(
+                    DISCOVERY_HOST,
+                    DISCOVERY_PORT,
+                    msg=(self.networking.host_name, self.server_port, self.protocol_port, standby),
+                    msg_type=MessageType.RegisterWorker,
+                    serializer=Serializer.MSGPACK,
+                )
+
+                if timeout_s is not None:
+                    self.id = await asyncio.wait_for(coro, timeout=timeout_s)
+                else:
+                    self.id = await coro
+
+                logging.warning(f"Worker id received from coordinator: {self.id}")
+                self.protocol_networking.set_worker_id(self.id)
+                self.networking.set_worker_id(self.id)
+            except asyncio.CancelledError:
+                # Never swallow cancellation; let shutdowns be fast/clean.
+                raise
+            except Exception as e:
+                # Stop if finite retries and we've exhausted them.
+                if not infinite_retries and attempt >= max_retries:
+                    logging.exception(f"Failed to register to coordinator after {attempt} attempts.")
+                    raise
+
+                # Exponential backoff with *full jitter*:
+                cap = min(max_delay_s, base_delay_s * (2 ** (attempt - 1)))
+                delay = random.uniform(0.0, cap)  # noqa: S311
+
+                # Use exception() occasionally to keep a stacktrace in logs without spamming too hard.
+                # (You can tune this: e.g., every N attempts.)
+                if attempt == 1 or attempt % 10 == 0:
+                    logging.exception(
+                        f"Register attempt {attempt} failed; retrying in {delay:.2f}s (cap={cap:.2f}s).",
+                        exc_info=e,
+                    )
+                else:
+                    logging.warning(
+                        f"Register attempt {attempt} failed ({type(e).__name__}: {e}); "
+                        f"retrying in {delay:.2f}s (cap={cap:.2f}s)."
+                    )
+
+                await asyncio.sleep(delay)
+            else:
+                return
 
     @staticmethod
     async def heartbeat_coroutine(worker_id: int, worker_pid: int) -> None:
@@ -1011,7 +1059,9 @@ class Worker:
                 args=(self.snapshotting_port, self.id),
             )
             self.async_snapshotting_proc.start()
+            logging.warning("Worker snapshotting process online")
             self.heartbeat_proc.start()
+            logging.warning("Worker heartbeat process online")
 
             # Start queue workers:
             # - control_queue: single worker for ordered control-plane traffic

@@ -1,8 +1,11 @@
 from collections import defaultdict
 import multiprocessing
+import os
 import random
 import sys
 import time
+
+import boto3
 
 multiprocessing.set_start_method("fork", force=True)
 from multiprocessing import Pool
@@ -10,7 +13,6 @@ from timeit import default_timer as timer
 
 import calculate_metrics
 import kafka_output_consumer
-from minio import Minio
 import pandas as pd
 from styx.client.sync_client import SyncStyxClient
 from styx.common.local_state_backends import LocalStateBackend
@@ -29,13 +31,15 @@ messages_per_second = int(sys.argv[4])
 sleeps_per_second = 100
 sleep_time = 0.0085
 seconds = int(sys.argv[5])
-STYX_HOST: str = "localhost"
-STYX_PORT: int = 8886
-KAFKA_URL = "localhost:9092"
+STYX_HOST: str = os.getenv("STYX_HOST", "localhost")
+STYX_PORT: int = int(os.getenv("STYX_PORT", "8886"))
+KAFKA_URL: str = os.getenv("KAFKA_URL", "localhost:9092")
 SAVE_DIR: str = sys.argv[6]
 warmup_seconds: int = int(sys.argv[7])
 
-g = StateflowGraph("ycsb-benchmark", operator_state_backend=LocalStateBackend.DICT)
+g = StateflowGraph("ycsb-benchmark",
+                   operator_state_backend=LocalStateBackend.DICT,
+                   max_operator_parallelism=N_PARTITIONS)
 ycsb_operator.set_n_partitions(N_PARTITIONS)
 g.add_operators(ycsb_operator)
 
@@ -125,9 +129,14 @@ def main():
     if N_ENTITIES < 3:
         print("Impossible to run this benchmark with one key")
         return
-
-    minio = Minio("localhost:9000", access_key="minio", secret_key="minio123", secure=False)
-    styx_client = SyncStyxClient(STYX_HOST, STYX_PORT, kafka_url=KAFKA_URL, minio=minio)
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=os.getenv("S3_ENDPOINT") or "http://localhost:9000",
+        aws_access_key_id=os.getenv("S3_ACCESS_KEY") or "rustfsadmin",
+        aws_secret_access_key=os.getenv("S3_SECRET_KEY") or "rustfsadmin",
+        region_name=os.getenv("S3_REGION") or "us-east-1"
+    )
+    styx_client = SyncStyxClient(STYX_HOST, STYX_PORT, kafka_url=KAFKA_URL, s3=s3)
     ycsb_init(styx_client, ycsb_operator)
     del styx_client
     time.sleep(5)

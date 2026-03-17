@@ -1,8 +1,9 @@
 import hashlib
 import multiprocessing
+import os
 import subprocess
 
-from minio import Minio
+import boto3
 
 multiprocessing.set_start_method("fork", force=True)
 from multiprocessing import Pool
@@ -46,16 +47,17 @@ sleep_time = 0.0085
 seconds = int(sys.argv[5])
 warmup_seconds = int(sys.argv[6])
 epoch_size = int(sys.argv[7])
-STYX_HOST: str = 'localhost'
-STYX_PORT: int = 8886
-KAFKA_URL = 'localhost:9092'
+STYX_HOST: str = os.getenv("STYX_HOST", "localhost")
+STYX_PORT: int = int(os.getenv("STYX_PORT", "8886"))
+KAFKA_URL: str = os.getenv("KAFKA_URL", "localhost:9092")
 current_time = datetime.now().strftime("%m%d_%H%M")
 SAVE_DIR: str = f"{sys.argv[1]}/dmr{messages_per_second}tps_{N_PARTITIONS}part_{current_time}"
 if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
-kill_at = int(sys.argv[8]) if len(sys.argv) > 8 else -1
 
-g = StateflowGraph("deathstar_movie_review", operator_state_backend=LocalStateBackend.DICT)
+g = StateflowGraph("deathstar_movie_review",
+                   operator_state_backend=LocalStateBackend.DICT,
+                   max_operator_parallelism=N_PARTITIONS)
 ####################################################################################################################
 compose_review_operator.set_n_partitions(N_PARTITIONS)
 movie_id_operator.set_n_partitions(N_PARTITIONS)
@@ -242,8 +244,14 @@ def benchmark_runner(proc_num) -> dict[bytes, dict]:
 
 
 def main():
-    minio = Minio("localhost:9000", access_key="minio", secret_key="minio123", secure=False)
-    styx_client = SyncStyxClient(STYX_HOST, STYX_PORT, kafka_url=KAFKA_URL, minio=minio)
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=os.getenv("S3_ENDPOINT") or "http://localhost:9000",
+        aws_access_key_id=os.getenv("S3_ACCESS_KEY") or "rustfsadmin",
+        aws_secret_access_key=os.getenv("S3_SECRET_KEY") or "rustfsadmin",
+        region_name=os.getenv("S3_REGION") or "us-east-1"
+    )
+    styx_client = SyncStyxClient(STYX_HOST, STYX_PORT, kafka_url=KAFKA_URL, s3=s3)
     styx_client.open(consume=False)
 
     deathstar_init(styx_client)

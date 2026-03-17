@@ -20,8 +20,8 @@ from styx.common.stateflow_graph import StateflowGraph
 from styx.common.tcp_networking import NetworkingManager
 
 if TYPE_CHECKING:
+    from botocore.client import BaseClient as S3Client
     from confluent_kafka.admin import ClusterMetadata
-    from minio import Minio
 
     from styx.common.base_operator import BaseOperator
     from styx.common.types import K
@@ -42,7 +42,7 @@ class SyncStyxClient(BaseStyxClient):
         styx_coordinator_adr: str,
         styx_coordinator_port: int,
         kafka_url: str,
-        minio: Minio | None = None,
+        s3: S3Client | None = None,
     ) -> None:
         """Initializes a synchronous Styx client.
 
@@ -51,7 +51,7 @@ class SyncStyxClient(BaseStyxClient):
             styx_coordinator_port (int): Port of the Styx coordinator.
             kafka_url (str): Kafka bootstrap server URL.
         """
-        super().__init__(styx_coordinator_adr, styx_coordinator_port, minio)
+        super().__init__(styx_coordinator_adr, styx_coordinator_port, s3)
         self._kafka_url = kafka_url
         self._futures: dict[bytes, StyxFuture] = {}
         self.running_result_consumer = False
@@ -317,6 +317,24 @@ class SyncStyxClient(BaseStyxClient):
         msg = NetworkingManager.encode_message(
             msg=(stateflow_graph,),
             msg_type=MessageType.SendExecutionGraph,
+            serializer=Serializer.CLOUDPICKLE,
+        )
+        s = socket.socket()
+        s.connect((self._styx_coordinator_adr, self._styx_coordinator_port))
+        s.send(msg)
+        s.close()
+
+    def update_dataflow(
+        self,
+        stateflow_graph: StateflowGraph,
+        external_modules: tuple | None = None,
+    ) -> None:
+        self._verify_dataflow_input(stateflow_graph, external_modules)
+        self._current_active_graph = stateflow_graph
+        self.graph_known_event.set()
+        msg = NetworkingManager.encode_message(
+            msg=(stateflow_graph,),
+            msg_type=MessageType.UpdateExecutionGraph,
             serializer=Serializer.CLOUDPICKLE,
         )
         s = socket.socket()

@@ -1,8 +1,11 @@
 import multiprocessing
+import os
 import subprocess
 import sys
 import time
 import os
+
+import boto3
 
 multiprocessing.set_start_method("fork", force=True)
 from multiprocessing import Pool
@@ -11,7 +14,6 @@ from datetime import datetime
 
 import calculate_metrics
 import kafka_output_consumer
-from minio import Minio
 import pandas as pd
 from styx.client.sync_client import SyncStyxClient
 from styx.common.local_state_backends import LocalStateBackend
@@ -37,24 +39,27 @@ batch_size = max(1, messages_per_second // sleeps_per_second)
 sleep_time = 0.0085
 seconds = int(sys.argv[6])
 key_list: list[int] = list(range(N_ENTITIES))
-STYX_HOST: str = "localhost"
-STYX_PORT: int = 8886
-# STYX_HOST: str = '35.229.80.128'
-# STYX_PORT: int = 8888
-KAFKA_URL = "localhost:9092"
-# KAFKA_URL = '35.229.114.18:9094'
+STYX_HOST: str = os.getenv("STYX_HOST", "localhost")
+STYX_PORT: int = int(os.getenv("STYX_PORT", "8886"))
+KAFKA_URL: str = os.getenv("KAFKA_URL", "localhost:9092")
+S3_URL: str = os.getenv("S3_ENDPOINT") or "http://localhost:9000"
+S3_ACC_KEY: str = os.getenv("S3_ACCESS_KEY") or "rustfsadmin"
+S3_SEC_KEY: str = os.getenv("S3_SECRET_KEY") or "rustfsadmin"
+S3_REG: str = os.getenv("S3_REGION") or "us-east-1"
 
 current_time = datetime.now().strftime("%m%d_%H%M")
 SAVE_DIR: str = f"{sys.argv[7]}/ycsb_{messages_per_second}tps_{N_PARTITIONS}part_{current_time}"
 if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
+
 warmup_seconds: int = int(sys.argv[8])
 run_with_validation = sys.argv[9].lower() == "true"
 epoch_size = int(sys.argv[10])
 kill_at: int = int(sys.argv[11]) if len(sys.argv) > 11 else -1
 ####################################################################################################################
-
-g = StateflowGraph("ycsb-benchmark", operator_state_backend=LocalStateBackend.DICT)
+g = StateflowGraph("ycsb-benchmark",
+                   operator_state_backend=LocalStateBackend.DICT,
+                   max_operator_parallelism=N_PARTITIONS)
 ycsb_operator.set_n_partitions(N_PARTITIONS)
 g.add_operators(ycsb_operator)
 
@@ -149,8 +154,14 @@ def main():
         print("Impossible to run this benchmark with one key")
         return
 
-    minio = Minio("localhost:9000", access_key="minio", secret_key="minio123", secure=False)
-    styx_client = SyncStyxClient(STYX_HOST, STYX_PORT, kafka_url=KAFKA_URL, minio=minio)
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=S3_URL,
+        aws_access_key_id=S3_ACC_KEY,
+        aws_secret_access_key=S3_SEC_KEY,
+        region_name=S3_REG
+    )
+    styx_client = SyncStyxClient(STYX_HOST, STYX_PORT, kafka_url=KAFKA_URL, s3=s3)
     ycsb_init(styx_client, ycsb_operator, key_list)
     del styx_client
     time.sleep(5)

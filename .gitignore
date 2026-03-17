@@ -129,8 +129,6 @@ dmypy.json
 
 .idea
 
-minio-volume
-
 *.csv
 *.json
 *.pdf
@@ -155,4 +153,11 @@ grafana_data/
 ycsb_dataset_*
 prometheus-data/
 
+!charts/grafana/files/grafana/dashboards/server_specific.json
+!charts/grafana/files/grafana/dashboards/styx.json
+!charts/grafana/*
+
 logs
+
+charts/styx-cluster/Chart.lock
+charts/styx-cluster/charts

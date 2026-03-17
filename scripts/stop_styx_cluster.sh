@@ -14,4 +14,4 @@ docker compose logs worker-standby | grep -v '|[[:space:]]*$' > "logs/worker-sta
 # DELETE PREVIOUS DEPLOYMENT
 docker compose down --volumes --remove-orphans
 docker compose -f docker-compose-kafka.yml down --volumes --remove-orphans
-docker compose -f docker-compose-minio.yml down --volumes --remove-orphans
+docker compose -f docker-compose-s3.yml down --volumes --remove-orphans
