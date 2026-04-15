@@ -29,6 +29,8 @@ n_keys=${10}
 [ -n "${13:-}" ] && enable_compression=${13}
 [ -n "${14:-}" ] && use_composite_keys=${14}
 [ -n "${15:-}" ] && use_fallback_cache=${15}
+autoscaling_enabled="false"
+
 docker compose logs worker | sort -t '|' -k1,1 -k2,2 > worker-logs.log
 docker compose logs coordinator > coordinator-logs.log
 docker compose logs worker-standby | sort -t '|' -k1,1 -k2,2 > worker-standby-logs.log
@@ -58,6 +60,15 @@ echo "use_fallback_cache: $use_fallback_cache"
 echo "regenerate_tpcc_data: $regenerate_tpcc_data"
 echo "============================================================"
 
+case "$workload_profile" in
+    constant|increasing|decreasing|random|cosine|step) ;;
+    *)
+        echo "ERROR: Unknown workload profile: $workload_profile"
+        exit 1
+        ;;
+esac
+load_config_path="demo/load_profiles/$workload_profile.yaml"
+
 bash "$ROOT_DIR/scripts/start_styx_cluster.sh" \
   "$start_n_part" "$epoch_size" "$styx_threads_per_worker" \
   "$enable_compression" "$use_composite_keys" "$use_fallback_cache"
@@ -69,7 +80,7 @@ if [[ "$workload_name" == "ycsb" ]]; then
 
     python "$ROOT_DIR/demo/demo-migration-ycsb/client.py" \
         "$client_threads" "$start_n_part" "$end_n_part" \
-        "$input_rate" "$total_time" "$saving_dir" "$warmup_seconds" "$n_keys"
+        "$input_rate" "$total_time" "$saving_dir" "$warmup_seconds" "$n_keys" "$load_config_path" "$autoscaling_enabled"
 
 elif [[ "$workload_name" == "tpcc" ]]; then
 
@@ -100,7 +111,7 @@ elif [[ "$workload_name" == "tpcc" ]]; then
     python "$ROOT_DIR/demo/demo-migration-tpc-c/pure_kafka_demo.py" \
         "$saving_dir" "$client_threads" "$start_n_part" "$end_n_part" \
         "$input_rate" "$total_time" "$warmup_seconds" "$n_keys" \
-        "$enable_compression" "$use_composite_keys" "$use_fallback_cache"
+        "$enable_compression" "$use_composite_keys" "$use_fallback_cache" "$load_config_path" "$autoscaling_enabled"
 
 else
     echo "Benchmark not supported: $workload_name"

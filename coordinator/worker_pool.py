@@ -170,7 +170,12 @@ class WorkerPool:
         operator: Operator | BaseOperator,
     ) -> None:
         """Add an operator partition using RoundRobin"""
-        worker: Worker = self.pop()
+        worker: Worker | None = self.pop()
+        if worker is None:
+            raise RuntimeError(
+                f"Cannot schedule operator partition {operator_partition}: no workers available in the pool. "
+                "Ensure at least one worker has registered before submitting the execution graph."
+            )
         self.operator_partition_to_worker[operator_partition] = worker.worker_id
         worker.assigned_operators[operator_partition] = operator
         self.put(worker)

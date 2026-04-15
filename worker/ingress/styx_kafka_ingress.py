@@ -83,7 +83,11 @@ class StyxKafkaIngress(BaseIngress):
         current_epoch = self.sequencer.epoch_counter
         if current_epoch != self._ingress_epoch:
             self.log_epoch_stats(self._ingress_epoch, self.epoch_stats)
-            self.epoch_stats = {"consumed": 0, "sequenced": 0, "forwarded_wrong_partition": 0}
+            self.epoch_stats = {
+                "consumed": 0,
+                "sequenced": 0,
+                "forwarded_wrong_partition": 0,
+            }
             self._ingress_epoch = current_epoch
 
         # logging.info(

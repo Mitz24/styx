@@ -16,7 +16,15 @@ dependencies = [
     "styx",
     "uvloop==0.22.1",
     "zstandard==0.25.0",
+    "chronos-forecasting==2.2.2",
+    "pandas==3.0.1",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.uv.sources]
 styx = { path = "../styx-package" }
+torch = { index = "pytorch-cpu" }

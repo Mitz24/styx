@@ -19,24 +19,32 @@ WORKDIR /usr/local/styx
 USER styx
 
 COPY --chown=styx:styx coordinator/pyproject.toml coordinator/uv.lock ./
+
+# Stage 1: Install all external deps (cached)
+RUN --mount=type=cache,target=/home/styx/.cache/uv,uid=1000,gid=1000 \
+    uv sync --frozen --no-install-package styx
+
 COPY --chown=styx:styx styx-package /usr/local/styx-package/
 
-# Use a cache mount to improve performance across builds
+# Stage 2: Copy local package and finish
 RUN --mount=type=cache,target=/home/styx/.cache/uv,uid=1000,gid=1000 \
     uv sync --frozen
 
 COPY --chown=styx:styx coordinator coordinator
+COPY --chown=styx:styx models models
 COPY --chown=styx:styx coordinator/start-coordinator.sh /usr/local/bin/
 
 RUN chmod a+x /usr/local/bin/start-coordinator.sh
 
 EXPOSE 8888
 
+ARG epoch_size=100
 ARG enable_compression=true
 ARG use_composite_keys=true
 ARG use_fallback_cache=true
 
-ENV ENABLE_COMPRESSION=$enable_compression \
+ENV SEQUENCE_MAX_SIZE=$epoch_size \
+    ENABLE_COMPRESSION=$enable_compression \
     USE_COMPOSITE_KEYS=$use_composite_keys \
     USE_FALLBACK_CACHE=$use_fallback_cache
 

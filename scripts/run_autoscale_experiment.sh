@@ -18,11 +18,12 @@ saving_dir=$8
 warmup_seconds=$9
 epoch_size=${10}
 workload_profile=${11}
-[ -n "${12}" ] && styx_threads_per_worker=${12}
-[ -n "${13}" ] && enable_compression=${13}
-[ -n "${14}" ] && use_composite_keys=${14}
-[ -n "${15}" ] && use_fallback_cache=${15}
-[ -n "${16}" ] && regenerate_tpcc_data=${16}
+num_standby_workers=${12:-1}
+[ -n "${13}" ] && styx_threads_per_worker=${13}
+[ -n "${14}" ] && enable_compression=${14}
+[ -n "${15}" ] && use_composite_keys=${15}
+[ -n "${16}" ] && use_fallback_cache=${16}
+[ -n "${17}" ] && regenerate_tpcc_data=${17}
 kill_at="-1" 
 autoscaling_enabled="true"
 
@@ -43,6 +44,7 @@ echo "total_time: $total_time"
 echo "saving_dir: $saving_dir"
 echo "warmup_seconds: $warmup_seconds"
 echo "epoch_size: $epoch_size"
+echo "num_standby_workers: $num_standby_workers"
 echo "styx_threads_per_worker: $styx_threads_per_worker"
 echo "enable_compression: $enable_compression"
 echo "use_composite_keys: $use_composite_keys"
@@ -75,6 +77,15 @@ _k8s_setup() {
     export S3_ENDPOINT="http://${RELEASE_NAME}-rustfs:9000"
 }
 
+case "$workload_profile" in
+    constant|increasing|decreasing|random|cosine|step) ;;
+    *)
+        echo "ERROR: Unknown workload profile: $workload_profile"
+        exit 1
+        ;;
+esac
+load_config_path="demo/load_profiles/$workload_profile.yaml"
+
 if [[ "$DEPLOY_MODE" == "k8s-minikube" || "$DEPLOY_MODE" == "k8s-cluster" ]]; then
     bash scripts/install_styx_cluster_with_helm.sh
     _k8s_setup
@@ -82,20 +93,41 @@ if [[ "$DEPLOY_MODE" == "k8s-minikube" || "$DEPLOY_MODE" == "k8s-cluster" ]]; th
 else
     # docker-compose mode
     bash scripts/start_styx_cluster.sh "$n_part" "$epoch_size" "$styx_threads_per_worker" "$enable_compression" "$use_composite_keys" "$use_fallback_cache" "$autoscaling_enabled"
-    sleep 10
-    docker compose --profile autoscale up --scale worker-standby=1 -d worker-standby >/dev/null
+    docker compose --profile autoscale up --scale worker-standby="$num_standby_workers" -d worker-standby >/dev/null
+
+    # Wait for at least one worker to register with the coordinator
+    echo "Waiting for workers to register with coordinator..."
+    max_wait=120
+    waited=0
+    while true; do
+        # Query Prometheus metrics for live_worker_count
+        worker_count=$(curl -s http://localhost:8000/metrics 2>/dev/null | grep -E '^live_worker_count ' | awk '{print $2}' | cut -d. -f1 || true)
+        if [[ -n "$worker_count" && "$worker_count" -ge 1 ]]; then
+            echo "Workers ready: $worker_count worker(s) registered"
+            break
+        fi
+        if [[ "$waited" -ge "$max_wait" ]]; then
+            echo "ERROR: Timed out waiting for workers after ${max_wait}s"
+            exit 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+        if (( waited % 5 == 0 )); then
+            echo "  Still waiting for workers... (${waited}s / ${max_wait}s)"
+        fi
+    done
 fi
 
 if [[ $workload_name == "ycsbt" ]]; then
     # YCSB-T
     run_with_validation=false
-    python demo/demo-ycsb/client.py "$client_threads" "$n_keys" "$n_part" "$zipf_const" "$input_rate" "$total_time" "$saving_dir" "$warmup_seconds" "$run_with_validation" "$epoch_size" "$workload_profile" "$autoscaling_enabled" "$kill_at"
+    python demo/demo-ycsb/client.py "$client_threads" "$n_keys" "$n_part" "$zipf_const" "$input_rate" "$total_time" "$saving_dir" "$warmup_seconds" "$run_with_validation" "$epoch_size" "$load_config_path" "$autoscaling_enabled" "$kill_at"
 elif [[ $workload_name == "dhr" ]]; then
     # Deathstar Hotel Reservation
-    python demo/demo-deathstar-hotel-reservation/pure_kafka_demo.py "$saving_dir" "$client_threads" "$n_part" "$input_rate" "$total_time" "$warmup_seconds" "$epoch_size" "$workload_profile" "$autoscaling_enabled" "$kill_at"
+    python demo/demo-deathstar-hotel-reservation/pure_kafka_demo.py "$saving_dir" "$client_threads" "$n_part" "$input_rate" "$total_time" "$warmup_seconds" "$epoch_size" "$load_config_path" "$autoscaling_enabled" "$kill_at"
 elif [[ $workload_name == "dmr" ]]; then
     # Deathstar Movie Review
-    python demo/demo-deathstar-movie-review/pure_kafka_demo.py "$saving_dir" "$client_threads" "$n_part" "$input_rate" "$total_time" "$warmup_seconds" "$epoch_size" "$workload_profile" "$autoscaling_enabled" "$kill_at"
+    python demo/demo-deathstar-movie-review/pure_kafka_demo.py "$saving_dir" "$client_threads" "$n_part" "$input_rate" "$total_time" "$warmup_seconds" "$epoch_size" "$load_config_path" "$autoscaling_enabled" "$kill_at"
 elif [[ $workload_name == "tpcc" ]]; then
     # TPC-C
     DATA_DIR="demo/demo-tpc-c/data_${n_keys}"
@@ -125,7 +157,7 @@ elif [[ $workload_name == "tpcc" ]]; then
     python demo/demo-tpc-c/pure_kafka_demo.py \
         "$saving_dir" "$client_threads" "$n_part" \
         "$input_rate" "$total_time" "$warmup_seconds" \
-        "$n_keys" "$enable_compression" "$use_composite_keys" "$use_fallback_cache" "$epoch_size" "$workload_profile" "$autoscaling_enabled" "$kill_at"
+        "$n_keys" "$enable_compression" "$use_composite_keys" "$use_fallback_cache" "$epoch_size" "$load_config_path" "$autoscaling_enabled" "$kill_at"
 else
     echo "Benchmark not supported!"
 fi

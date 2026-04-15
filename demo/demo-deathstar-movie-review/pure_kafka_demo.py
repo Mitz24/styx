@@ -55,7 +55,7 @@ current_time = datetime.now().strftime("%m%d_%H%M")
 SAVE_DIR: str = f"{sys.argv[1]}/dmr{messages_per_second}tps_{N_PARTITIONS}part_{current_time}"
 if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
-workload_profile: str = sys.argv[8]
+load_config_path: str = sys.argv[8]
 autoscaling_enabled: bool = sys.argv[9].lower() == "true"
 kill_at = int(sys.argv[10]) if len(sys.argv) > 10 else -1
 
@@ -84,42 +84,11 @@ g.add_operators(
     frontend_operator
 )
 
-step_size = 5  # in seconds
-
-if workload_profile == "constant":
-    load_schedule = LoadSchedule.from_generator(
-        "constant", step_size,
-        target_tps=messages_per_second,
-        time=seconds
-    )
-elif workload_profile in ("increase", "decrease", "random"):
-    load_schedule = LoadSchedule.from_generator(
-        workload_profile, step_size,
-        target_tps=messages_per_second,
-        time=seconds,
-        magnitude=5000
-    )
-elif workload_profile == "cosine":
-    load_schedule = LoadSchedule.from_generator(
-        "cosine", step_size,
-        target_tps=messages_per_second,
-        time=seconds,
-        cosine_period=20,
-        mean_input_rate=messages_per_second,
-        max_divergence=messages_per_second // 2,
-        max_noise=50
-    )
-elif workload_profile == "step":
-    load_schedule = LoadSchedule.from_generator(
-        "step", step_size,
-        target_tps=messages_per_second,
-        time=seconds,
-        initial_round_length=40,
-        regular_round_length=60,
-        round_rates=[1000, 2000, 7000, 4000]
-    )
-else:
-    raise ValueError(f"Unknown workload profile: {workload_profile}")
+load_schedule = LoadSchedule.from_config_file(
+    load_config_path, 
+    target_tps=messages_per_second,
+    time=seconds
+)
 
 # -------------------------------------------------------------------------------------
 # init_data helpers
@@ -260,8 +229,9 @@ def benchmark_runner(proc_num) -> dict[bytes, dict]:
             subprocess.run(["docker", "kill", "styx-worker-1"], check=False)
             print("KILL -> styx-worker-1 done")
         sec_start = timer()
-        for i in range(messages_per_second):
-            if i % (messages_per_second // sleeps_per_second) == 0:
+        current_tps = load_schedule.get_tps(second)
+        for i in range(current_tps):
+            if i % (current_tps // sleeps_per_second) == 0:
                 time.sleep(sleep_time)
             operator, key, func_name, params = next(deathstar_generator)
             future = styx.send_event(operator=operator,
@@ -275,7 +245,7 @@ def benchmark_runner(proc_num) -> dict[bytes, dict]:
         if lps < 1:
             time.sleep(1 - lps)
         sec_end2 = timer()
-        print(f"Latency per second: {sec_end2 - sec_start}")
+        print(f"{second} | TPS: {current_tps} | Latency: {sec_end2 - sec_start:.3f}s")
     end = timer()
     print(f"Average latency per second: {(end - start) / seconds}")
     styx.close()

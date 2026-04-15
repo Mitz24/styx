@@ -1,12 +1,12 @@
 import asyncio
-from collections import defaultdict
-from dataclasses import astuple
 import os
 import time
-from timeit import default_timer as timer
-import traceback
-from typing import TYPE_CHECKING
 
+from traceback import format_exc
+from timeit import default_timer as timer
+from typing import TYPE_CHECKING
+from dataclasses import astuple
+from collections import defaultdict
 from msgspec import msgpack
 from setuptools._distutils.util import strtobool
 from styx.common.base_protocol import BaseTransactionalProtocol
@@ -203,7 +203,6 @@ class AriaProtocol(BaseTransactionalProtocol):
         self._idle_time_ms: float = 0.0  # Idle time in ms for current epoch
         # Track epochs with no local work (forced to sync by coordinator)
         self._empty_epoch: bool = False  # True if current epoch had no local sequence
-        # Processing time tracking for utilization calculation
         self.cpu_work_ms: float = 0.0  # Time spent in actual function execution
 
         self.operator_metrics = {}
@@ -249,8 +248,7 @@ class AriaProtocol(BaseTransactionalProtocol):
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            # This will log the full traceback
-            logging.error(f"Task {task.get_name()} crashed: {e}\n{traceback.format_exc()}")
+            logging.error(f"Task {task.get_name()} crashed: {e}\n{format_exc()}")
 
     def start(self) -> None:
         self.function_scheduler_task = asyncio.create_task(self.function_scheduler())
@@ -569,18 +567,16 @@ class AriaProtocol(BaseTransactionalProtocol):
         self._idle_time_ms = (idle_end - idle_start) * 1000  # Convert to ms
         # Track if this is an empty epoch (no local work, just sync)
         self._empty_epoch = not bool(sequence)
-        logging.debug(f"Idle time: {self._idle_time_ms:.2f}ms, empty_epoch: {self._empty_epoch}")
 
         self.currently_processing = True
-        logging.warning(f"{self.id} ||| Epoch: {self.sequencer.epoch_counter} starts")
-        logging.warning(f"{self.id} ||| Running {len(sequence)} functions...")
+        logging.warning(f"{self.id} ||| Epoch: {self.sequencer.epoch_counter} running {len(sequence)} functions...")
         self.phase_resource_tracker.reset_epoch()
 
         timings = await self._run_epoch_functions_and_chain(sequence)
         logging.debug(f"Finished running {len(sequence)} functions")
 
         sync_time = 0.0
-        # Capture LOCAL logic aborts before sync overwrites with global
+        # Capture local logic aborts before sync overwrites with global
         logic_aborts_count = len(self.networking.logic_aborts_everywhere)
         sync_time += await self._sync_processing_done()
         logging.debug("Finished syncing processing")
@@ -676,12 +672,13 @@ class AriaProtocol(BaseTransactionalProtocol):
         wal_time = round(timings["wal_ms"], 4)
         snap_time = (snap_end - snap_start) * 1000
 
-        cpu_work_ms = func_time + conflict_resolution_time + fallback_time
-        io_wait_time_ms = chain_time + wal_time + snap_time + sync_time  # + commit_time_ms
+        cpu_work_ms = func_time + conflict_resolution_time + commit_time + fallback_time
+        io_wait_time_ms = chain_time + wal_time + snap_time + sync_time
         # ratio of processing time to total time
         cpu_utilization = (cpu_work_ms / epoch_latency) if epoch_latency > 0 else 0.0
         # ratio of IO wait time to total time
         io_wait_utilization = (io_wait_time_ms / epoch_latency) if epoch_latency > 0 else 0.0
+        key_counts = sum(len(data) for data in self.local_state.data.values())
 
         worker_epoch_stats = WorkerEpochStats(
             worker_id=self.id,
@@ -710,6 +707,7 @@ class AriaProtocol(BaseTransactionalProtocol):
             io_wait_utilization=io_wait_utilization,
             operator_epoch_stats=operator_epoch_stats,
             phase_resources=phase_resources,
+            key_counts=key_counts,
         )
         logging.debug(
             f"{self.id} ||| Epoch: {self.sequencer.epoch_counter - 1} done in "
@@ -730,7 +728,6 @@ class AriaProtocol(BaseTransactionalProtocol):
     and the partition is not the same as the new partition, the transaction needs to be redirected
     to the new partition decided by the previous migration.
     """
-
     async def _redirect_migration_backlog_transactions(self, sequence: list[SequencedItem]) -> list[SequencedItem]:
         sequence_to_process = []
         for seq_item in sequence:

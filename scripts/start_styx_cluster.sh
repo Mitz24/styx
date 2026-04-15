@@ -45,7 +45,7 @@ docker compose build \
     --build-arg use_composite_keys="$use_composite_keys" \
     --build-arg use_fallback_cache="$use_fallback_cache"
 if [[ "$enable_autoscale" == "true" ]]; then
-    docker compose --profile autoscale build
+    docker compose build worker-standby
 fi
 docker compose up --scale worker="$threaded_scale_factor" -d >/dev/null
 sleep 5

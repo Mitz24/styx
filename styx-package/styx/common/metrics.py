@@ -28,4 +28,5 @@ class WorkerEpochStats:
     cpu_utilization: float
     io_wait_utilization: float
     operator_epoch_stats: list[tuple[str, int, float, float, int]]
-    phase_resources: dict[str, float]
+    phase_resources: dict[str, dict[str, int]]
+    key_counts: dict[str, int]

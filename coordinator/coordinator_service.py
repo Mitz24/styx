@@ -11,6 +11,7 @@ import os
 import socket
 import struct
 import time
+from math import ceil
 from timeit import default_timer as timer
 from typing import TYPE_CHECKING
 
@@ -30,6 +31,9 @@ from styx.common.tcp_networking import MessagingMode, NetworkingManager
 from styx.common.util.aio_task_scheduler import AIOTaskScheduler
 import uvloop
 
+from coordinator.capacity_model import SystemCapacityEstimator
+from coordinator.chronos_forecaster import ChronosForecaster
+from coordinator.metric_buffer import AggregatingMetricBuffer
 from coordinator.migration_metadata import MigrationMetadata
 from coordinator.pid_controller import BacklogPIDController
 
@@ -55,6 +59,10 @@ HEARTBEAT_CHECK_INTERVAL: int = int(
 )  # 1000ms
 S3_INIT_RETRY_SEC: float = float(os.getenv("S3_INIT_RETRY_SEC", "2"))
 S3_INIT_MAX_RETRIES: int = int(os.getenv("S3_INIT_MAX_RETRIES", "30"))
+
+ASYNC_MIGRATION_BATCH_SIZE: int = int(os.getenv("ASYNC_MIGRATION_BATCH_SIZE", "2000"))
+SEQUENCE_MAX_SIZE: int = int(os.getenv("SEQUENCE_MAX_SIZE", "1_000"))
+CHRONOS_FORECAST_INTERVAL: float = float(os.getenv("CHRONOS_FORECAST_INTERVAL", "2.0"))
 
 CoordHandler = Callable[[StreamWriter, bytes, concurrent.futures.ProcessPoolExecutor], Awaitable[None]]
 
@@ -124,6 +132,7 @@ class CoordinatorService:
         self.recovery_state: RecoveryState = RecoveryState.IDLE
 
         self.metrics_server = start_http_server(8000)
+        self.live_worker_count_gauge = Gauge("live_worker_count", "Number of live workers registered with coordinator")
         self.cpu_usage_gauge = Gauge("worker_cpu_usage_percent", "CPU usage percentage", ["instance"])
         self.memory_usage_gauge = Gauge("worker_memory_usage_mb", "Memory usage in MB", ["instance"])
         self.network_rx_gauge = Gauge("worker_network_rx_kb", "Network received KB", ["instance"])
@@ -140,7 +149,6 @@ class CoordinatorService:
         )
         self.snapshotting_gauge = Gauge("worker_total_snapshotting_time_ms", "Snapshotting time (ms)", ["instance"])
         self.heartbeat_gauge = Gauge("time_since_last_heartbeat", "Time Since Last Heartbeat", ["instance"])
-        self.backpressure_gauge = Gauge("worker_backpressure", "Backpressure on the worker", ["instance"])
         self.queue_backlog_gauge = Gauge("queue_backlog", "Backlog in the worker queue", ["instance"])
         self.idle_time_ms_gauge = Gauge("idle_time_ms_per_second", "Idle time ms per second", ["instance"])
 
@@ -197,7 +205,7 @@ class CoordinatorService:
 
         self.migration_start_time: float = 0.0
         self.migration_end_time: float = 0.0
-        
+
         # Used for annotations in the grafana dashboard
         self.migration_start_count = Counter("migration_start_total", "Number of migrations started", [])
         self.migration_end_count = Counter("migration_end_total", "Number of migrations completed", [])
@@ -271,7 +279,7 @@ class CoordinatorService:
         # Scaling policy parameters
         self.enable_autoscale: bool = bool(strtobool(os.getenv("ENABLE_AUTOSCALE", "true")))
         self.scale_up_cpu_threshold: float = 70.0
-        self.scale_cooldown_period: float = 10.0
+        self.scale_cooldown_period: float = 30.0
         self.last_scale_action_time: float = 0.0
         self.scaled_once: bool = False  # TEMPORARY
         self.scale_window_seconds: int = 5
@@ -280,10 +288,23 @@ class CoordinatorService:
         self.pid_controller = BacklogPIDController()
         # Per-epoch accumulators: populated as each worker reports, consumed when all have synced
         self.epoch_backlog_accum: dict[int, float] = {}
-        self.epoch_throughput_accum: dict[int, float] = {}
+        self.epoch_rate_accum: dict[int, float] = {}
+        self.total_tps_accum: dict[int, float] = {}
+        self.num_keys_accum: dict[int, int] = {}
 
+        self.epoch_duration_window = SlidingWindowMetric(5)
         self.tps_window_seconds: int = 10
         self.tps_sliding_window: SlidingWindowMetric = SlidingWindowMetric(self.tps_window_seconds)
+        self.system_capacity_estimator: SystemCapacityEstimator = SystemCapacityEstimator(
+            sequence_max_size=SEQUENCE_MAX_SIZE,
+            window_size=50,
+        )
+
+        # Chronos forecaster (background process)
+        self.total_keys_accum: int = 0
+        self.metric_buffer: AggregatingMetricBuffer = AggregatingMetricBuffer(bucket_interval=1.0, max_buckets=512)
+        self.chronos_forecaster: ChronosForecaster | None = None
+        self.forecaster_task: asyncio.Task | None = None
 
     async def scale_up(self, new_n_partitions: int, new_worker_num: int) -> None:
         if self.migration_in_progress:
@@ -437,6 +458,7 @@ class CoordinatorService:
     async def _submit_initial_graph(self, graph: StateflowGraph) -> None:
         await self.coordinator.submit_stateflow_graph(graph)
         n_workers = len(self.coordinator.worker_pool.get_participating_workers())
+        logging.info(f"Submitting graph with {n_workers} live worker(s)")
         self.aria_metadata = AriaSyncMetadata(n_workers)
 
     async def _handle_migration_repartitioning_done(
@@ -525,6 +547,7 @@ class CoordinatorService:
             logging.warning(
                 f"Worker registered {worker_ip}:{worker_port} with id {worker_id}",
             )
+            self.live_worker_count_gauge.set(len(self.coordinator.worker_pool.get_live_workers()))
 
     async def _track_reregistered_worker(self, worker_id: int) -> None:
         async with self.recovery_lock:
@@ -727,6 +750,7 @@ class CoordinatorService:
                 io_wait_utilization,
                 operator_epoch_stats,
                 phase_resources,
+                key_counts,
             ) = self.protocol_networking.decode_message(data)
 
             worker_epoch_stats = WorkerEpochStats(
@@ -756,14 +780,36 @@ class CoordinatorService:
                 io_wait_utilization=io_wait_utilization,
                 operator_epoch_stats=operator_epoch_stats,
                 phase_resources=phase_resources,
+                key_counts=key_counts,
             )
             self.epoch_backlog_accum[worker_id] = worker_epoch_stats.queue_backlog
-            self.epoch_throughput_accum[worker_id] = worker_epoch_stats.epoch_throughput
+            self.total_tps_accum[worker_id] = worker_epoch_stats.epoch_throughput
+            self.epoch_rate_accum[worker_id] = worker_epoch_stats.input_rate
+            self.num_keys_accum[worker_id] = worker_epoch_stats.key_counts
+            self.epoch_duration_window.add(worker_epoch_stats.epoch_latency)
 
             self._record_epoch_metrics(
                 worker_epoch_stats,
             )
 
+            cpu_work_ms = (
+                worker_epoch_stats.func_time
+                + worker_epoch_stats.conflict_res_time
+                + worker_epoch_stats.commit_time
+                + worker_epoch_stats.fallback_time
+            )
+            overhead_ms = worker_epoch_stats.epoch_latency - cpu_work_ms
+            self.system_capacity_estimator.record(
+                worker_id,
+                worker_epoch_stats.committed_txns,
+                cpu_work_ms,
+                overhead_ms,
+            )
+
+            # Feed the Chronos metric buffer
+            now = time.time()
+            self.metric_buffer.add("input_rate", worker_epoch_stats.input_rate, now)
+            
             sync_complete: bool = self.aria_metadata.set_empty_sync_done(worker_id)
             if not sync_complete:
                 return
@@ -777,12 +823,15 @@ class CoordinatorService:
 
             # All workers have synced -- aggregate epoch-level metrics
             total_backlog = sum(self.epoch_backlog_accum.values())
-            total_tps = sum(self.epoch_throughput_accum.values())
+            total_tps = sum(self.total_tps_accum.values())
+            self.total_keys = sum(self.num_keys_accum.values())
             self.tps_sliding_window.add(total_tps)
 
             # Clear accumulators for the next epoch
             self.epoch_backlog_accum.clear()
-            self.epoch_throughput_accum.clear()
+            self.epoch_rate_accum.clear()
+            self.num_keys_accum.clear()
+            #logging.warning(f"Epoch duration: {self.epoch_duration_window.average()}")
 
             if self.enable_autoscale and not self.migration_in_progress:
                 smoothed_tps = self.tps_sliding_window.average() or 0.0
@@ -799,6 +848,74 @@ class CoordinatorService:
                     new_partition_num = len(self.coordinator.worker_pool.get_participating_workers()) + to_add
                     await self.scale_up(new_partition_num, to_add)
                     self.last_scale_action_time = time.time()
+
+    def _estimate_migration_time(self, total_keys: int) -> float:
+        return (total_keys * self.epoch_duration_window.average() / ASYNC_MIGRATION_BATCH_SIZE) / 1000.0
+
+    def _compute_predictive_scaling(self, predictions: dict[str, list[float]]) -> tuple[bool, int]:
+        """Compare the Chronos forecast against the capacity model.
+        Returns (should_scale, workers_to_add).
+        """
+        n_workers = len(self.coordinator.worker_pool.get_participating_workers())
+        system_capacity = self.system_capacity_estimator.estimate_system_capacity()
+        if system_capacity is None:
+            return False, 0
+        # Use the 0.9 quantile (pessimistic) to TRIGGER scaling
+        peak_p90 = max(predictions.get("0.9", [0.0]))
+        # Use the 0.5 quantile (median) to SIZE the scale-up
+        peak_p50 = max(predictions.get("0.5", [0.0]))
+        headroom_factor = 1
+        effective_capacity = system_capacity * headroom_factor
+        logging.warning(
+            f"PREDICTIVE | peak_p90={peak_p90:.0f}  peak_p50={peak_p50:.0f}  "
+            f"capacity={system_capacity:.0f}  effective={effective_capacity:.0f}"
+        )
+        if peak_p50 <= effective_capacity:
+            return False, 0
+        per_worker_capacity = system_capacity / max(n_workers, 1)
+        n_needed = max(
+            n_workers + 1,
+            int(peak_p50 / (per_worker_capacity * headroom_factor)) + 1,
+        )
+        # Don't more than double the cluster in one step
+        to_add = min(n_needed - n_workers, n_workers)
+        logging.warning(
+            f"PREDICTIVE | SCALE UP: need {n_needed} workers "
+            f"(currently {n_workers}, adding {to_add})"
+        )
+        return True, to_add
+
+    async def chronos_forecast_loop(self) -> None:
+        """Periodically submit metric snapshots to the Chronos forecaster
+        process and poll for results.  Runs as a long-lived coroutine."""
+        while True:
+            await asyncio.sleep(CHRONOS_FORECAST_INTERVAL)
+            if self.chronos_forecaster is None or not self.chronos_forecaster.is_alive:
+                continue
+
+            context = self.metric_buffer.snapshot()
+            #print(f"CHRONOS | context: {context}")
+            if not context:
+                continue
+
+            estimated_migration_time = self._estimate_migration_time(self.total_keys)
+            logging.warning(f"Estimated migration time: {estimated_migration_time} seconds")
+
+            self.chronos_forecaster.submit(context, prediction_length=ceil(estimated_migration_time))
+            predictions = self.chronos_forecaster.poll()
+            if predictions and self.enable_autoscale and not self.migration_in_progress:
+                logging.warning(
+                    f"CHRONOS | predictions: {predictions}"
+                )
+                should_scale, to_add = self._compute_predictive_scaling(predictions)
+                if should_scale and not (
+                    time.time() - self.last_scale_action_time < self.scale_cooldown_period
+                ):
+                    n_workers = len(self.coordinator.worker_pool.get_participating_workers())
+                    new_partition_num = n_workers + to_add
+                    await self.scale_up(new_partition_num, to_add)
+                    self.last_scale_action_time = time.time()
+                    self.live_worker_count_gauge.set(len(self.coordinator.worker_pool.get_live_workers()))
 
     def _record_epoch_metrics(
         self,
@@ -973,28 +1090,6 @@ class CoordinatorService:
             )
             async with server:
                 await server.serve_forever()
-
-    async def analyze_scaling_metrics(self, cpu_val: float, worker_id: int) -> None:
-        if (
-            time.time() - self.last_scale_action_time < self.scale_cooldown_period
-            or self.scaled_once
-            or not self.coordinator.worker_pool.is_worker_active(worker_id)
-        ):
-            return
-
-        logging.warning(f"Analyzing scaling metrics for CPU value: {cpu_val} and worker: {worker_id}")
-        if worker_id not in self.coordinator.worker_pool.standby_worker_ids:
-            self.cpu_metric_window.add(cpu_val)
-        avg_cpu = self.cpu_metric_window.average()
-        logging.warning(f"Current average CPU value: {avg_cpu}")
-
-        ## Rolling average of the last self.scale_window_size cpu usage values
-        if avg_cpu and avg_cpu > self.scale_up_cpu_threshold and not self.scaled_once:
-            self.scaled_once = True
-            self.last_scale_action_time = time.time()
-            to_add = 1
-            new_partition_num = len(self.coordinator.worker_pool.get_participating_workers()) + to_add
-            await self.scale_up(new_partition_num, to_add)
 
     async def finalize_migration_repartition(self) -> None:
         async with asyncio.TaskGroup() as tg:
@@ -1237,6 +1332,13 @@ class CoordinatorService:
         logging.warning("Coordinator Heartbeat Sentinel online")
         self.snapshotting_task = asyncio.create_task(self.send_snapshot_marker())
         logging.warning("Coordinator Snapshotting online")
+
+        if self.enable_autoscale:
+            self.chronos_forecaster = ChronosForecaster()
+            self.chronos_forecaster.start()
+            self.forecaster_task = asyncio.create_task(self.chronos_forecast_loop())
+            logging.warning("Chronos forecaster online (interval=%.1fs)", CHRONOS_FORECAST_INTERVAL)
+
         await self.tcp_service()
 
 

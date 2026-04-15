@@ -73,16 +73,20 @@ class StyxSocketClient:
         async with self.lock:
             while i < self.n_retries:
                 try:
+                    if self.writer is None:
+                        raise ConnectionError("Connection lost and reconnection failed")
                     self.writer.write(message)
                     await self.writer.drain()
-                except OSError, RuntimeError, ConnectionResetError, BrokenPipeError:
+                except (OSError, RuntimeError, ConnectionResetError, BrokenPipeError, ConnectionError, AttributeError, TypeError):
                     logging.warning(
-                        f"Broken connection in rq-rs, close the old ones and retry. "
+                        f"Broken connection in send_message, close the old ones and retry. "
                         f"Attempt {i} at {self.target_host}:{self.target_port}",
                     )
                     await self.close()
                     await asyncio.sleep(0.5)
-                    await self.create_connection(self.target_host, self.target_port)
+                    success = await self.create_connection(self.target_host, self.target_port)
+                    if not success:
+                        logging.warning(f"Reconnection attempt {i} failed for {self.target_host}:{self.target_port}")
                 except Exception as e:
                     logging.error(f"Uncaught exception: {e}")
                     i = self.n_retries
@@ -92,7 +96,7 @@ class StyxSocketClient:
                 i += 1
         if i == self.n_retries:
             logging.error(
-                f"Cannot send_message_rq_rs to worker {self.target_host}:{self.target_port}",
+                f"Cannot send_message to {self.target_host}:{self.target_port} after {self.n_retries} attempts",
             )
 
     async def send_message_rq_rs(self, message: bytes) -> bytes | None:
@@ -104,18 +108,22 @@ class StyxSocketClient:
         async with self.lock:
             while i < self.n_retries:
                 try:
+                    if self.writer is None or self.reader is None:
+                        raise ConnectionError("Connection lost and reconnection failed")
                     self.writer.write(message)
                     await self.writer.drain()
                     (size,) = unpack(">Q", await self.reader.readexactly(8))
                     resp = await self.reader.readexactly(size)
-                except OSError, RuntimeError, ConnectionResetError, BrokenPipeError:
+                except (OSError, RuntimeError, ConnectionResetError, BrokenPipeError, ConnectionError, AttributeError, TypeError):
                     logging.warning(
                         f"Broken connection in rq-rs, close the old ones and retry. "
                         f"Attempt {i} at {self.target_host}:{self.target_port}",
                     )
                     await self.close()
                     await asyncio.sleep(0.5)
-                    await self.create_connection(self.target_host, self.target_port)
+                    success = await self.create_connection(self.target_host, self.target_port)
+                    if not success:
+                        logging.warning(f"Reconnection attempt {i} failed for {self.target_host}:{self.target_port}")
                 except Exception as e:
                     logging.error(f"Uncaught exception: {e}")
                     i = self.n_retries
@@ -125,7 +133,7 @@ class StyxSocketClient:
                 i += 1
         if i == self.n_retries:
             logging.error(
-                f"Cannot send_message_rq_rs to worker {self.target_host}:{self.target_port}",
+                f"Cannot send_message_rq_rs to {self.target_host}:{self.target_port} after {self.n_retries} attempts",
             )
         return resp
 
@@ -173,8 +181,9 @@ class SocketPool:
     async def create_socket_connections(self) -> None:
         for _ in range(self.size):
             client = StyxSocketClient()
-            await client.create_connection(self.host, self.port)
-            self.conns.append(client)
+            success = await client.create_connection(self.host, self.port)
+            if success:
+                self.conns.append(client)
 
     async def close(self) -> None:
         for conn in self.conns:
@@ -211,13 +220,16 @@ class NetworkingManager(BaseNetworking):
             await pool.close()
 
     async def create_socket_connection(self, host: str, port: int) -> None:
-        self.pools[(host, port)] = SocketPool(
+        pool = SocketPool(
             host,
             port,
             size=self.socket_pool_size,
             mode=self.messaging_mode,
         )
-        await self.pools[(host, port)].create_socket_connections()
+        await pool.create_socket_connections()
+        if not pool.conns:
+            raise ConnectionError(f"Failed to establish any connections to {host}:{port}")
+        self.pools[(host, port)] = pool
 
     async def send_message(
         self,
@@ -229,7 +241,11 @@ class NetworkingManager(BaseNetworking):
     ) -> None:
         msg = self.encode_message(msg=msg, msg_type=msg_type, serializer=serializer)
         async with self.get_socket_lock:
-            if (host, port) not in self.pools:
+            pool = self.pools.get((host, port))
+            if pool is None or not pool.conns:
+                if pool is not None:
+                    await pool.close()
+                    del self.pools[(host, port)]
                 await self.create_socket_connection(host, port)
             socket_conn = next(self.pools[(host, port)])
         await socket_conn.send_message(msg)
@@ -337,7 +353,11 @@ class NetworkingManager(BaseNetworking):
     ) -> object:
         msg = self.encode_message(msg=msg, msg_type=msg_type, serializer=serializer)
         async with self.get_socket_lock:
-            if (host, port) not in self.pools:
+            pool = self.pools.get((host, port))
+            if pool is None or not pool.conns:
+                if pool is not None:
+                    await pool.close()
+                    del self.pools[(host, port)]
                 await self.create_socket_connection(host, port)
             socket_conn = next(self.pools[(host, port)])
 

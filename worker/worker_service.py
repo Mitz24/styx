@@ -627,7 +627,7 @@ class Worker:
         msg_type: MessageType,
     ) -> None:
         operator_partition, key, old_partition, host, port = self.networking.decode_message(data)
-        logging.warning(f"MIGRATION | RequestRemoteKey | operator_partition: {operator_partition} | key: {key}")
+        #logging.warning(f"MIGRATION | RequestRemoteKey | operator_partition: {operator_partition} | key: {key}")
         async with self.networking_locks[msg_type]:
             value = self.local_state.get_key_to_migrate(
                 operator_partition,

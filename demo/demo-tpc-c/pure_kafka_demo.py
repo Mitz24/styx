@@ -56,6 +56,7 @@ KAFKA_URL: str = os.getenv("KAFKA_URL", "localhost:9092")
 warmup_seconds = int(sys.argv[6])
 N_W = int(sys.argv[7])
 epoch_size = int(sys.argv[11])
+load_config_path: str = sys.argv[12]
 current_time = datetime.now().strftime("%m%d_%H%M")
 SAVE_DIR: str = f"{sys.argv[1]}/tpcc_{messages_per_second}tps_{N_PARTITIONS}part_{current_time}"
 if not os.path.exists(SAVE_DIR):
@@ -79,7 +80,6 @@ use_fallback_cache: bool = bool(strtobool(sys.argv[10]))
 os.environ["ENABLE_COMPRESSION"] = str(enable_compression)
 os.environ["USE_COMPOSITE_KEYS"] = str(use_composite_keys)
 os.environ["USE_FALLBACK_CACHE"] = str(use_fallback_cache)
-workload_profile: str = sys.argv[12]
 autoscaling_enabled: bool = sys.argv[13].lower() == "true"
 kill_at = int(sys.argv[14]) if len(sys.argv) > 14 else -1
 
@@ -117,42 +117,11 @@ g.add_operators(customer_operator, district_operator, history_operator, item_ope
                 new_order_txn_operator, customer_idx_operator, payment_txn_operator)
 
 
-step_size = 5  # in seconds
-
-if workload_profile == "constant":
-    load_schedule = LoadSchedule.from_generator(
-        "constant", step_size,
-        target_tps=messages_per_second,
-        time=seconds
-    )
-elif workload_profile in ("increase", "decrease", "random"):
-    load_schedule = LoadSchedule.from_generator(
-        workload_profile, step_size,
-        target_tps=messages_per_second,
-        time=seconds,
-        magnitude=5000
-    )
-elif workload_profile == "cosine":
-    load_schedule = LoadSchedule.from_generator(
-        "cosine", step_size,
-        target_tps=messages_per_second,
-        time=seconds,
-        cosine_period=20,
-        mean_input_rate=messages_per_second,
-        max_divergence=messages_per_second // 2,
-        max_noise=50
-    )
-elif workload_profile == "step":
-    load_schedule = LoadSchedule.from_generator(
-        "step", step_size,
-        target_tps=messages_per_second,
-        time=seconds,
-        initial_round_length=40,
-        regular_round_length=60,
-        round_rates=[1000, 2000, 7000, 4000]
-    )
-else:
-    raise ValueError(f"Unknown workload profile: {workload_profile}")
+load_schedule = LoadSchedule.from_config_file(
+    load_config_path, 
+    target_tps=messages_per_second,
+    time=seconds
+)
 
 # -------------------------------------------------------------------------------------
 # Cache helper
@@ -469,7 +438,7 @@ def benchmark_runner(proc_num) -> dict[bytes, dict]:
         sec_start = timer()
         current_tps = load_schedule.get_tps(second)
         for i in range(current_tps):
-            if i % (messages_per_second // sleeps_per_second) == 0:
+            if i % (current_tps // sleeps_per_second) == 0:
                 time.sleep(sleep_time)
             operator, key, func_name, params = next(tpc_c_generator)
             future = styx.send_event(operator=operator,

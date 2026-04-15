@@ -40,7 +40,7 @@ class IncreaseLoadGenerator(LoadGenerator):
         values = []
         val = self.target_tps
         for i in range(0, self.time):
-            val += random.randrange(int(-self.magnitude * (1 / 21)), int(self.magnitude * (1 / 28)))
+            val += random.randrange(int(-self.magnitude * (1 / 30)), int(self.magnitude * (1 / 22)))
             if self.max_threshold is not None and val > self.max_threshold:
                 val = self.max_threshold
             values.append(val)
@@ -57,7 +57,7 @@ class DecreaseLoadGenerator(LoadGenerator):
         values = []
         val = self.target_tps
         for i in range(0, self.time):
-            val += random.randrange(int(-self.magnitude * (1 / 30)), int(self.magnitude * (1 / 22)))
+            val += random.randrange(int(-self.magnitude * (1 / 21)), int(self.magnitude * (1 / 28)))
             if self.max_threshold is not None and val > self.max_threshold:
                 val = self.max_threshold
             values.append(val)
@@ -121,12 +121,11 @@ class ConstantLoadGenerator(LoadGenerator):
 
 
 class LoadSchedule:
-    """Maps elapsed time to TPS values based on a step size."""
 
     GENERATORS: dict[str, type[LoadGenerator]] = {
         "constant": ConstantLoadGenerator,
-        "increase": IncreaseLoadGenerator,
-        "decrease": DecreaseLoadGenerator,
+        "increasing": IncreaseLoadGenerator,
+        "decreasing": DecreaseLoadGenerator,
         "cosine": CosineLoadGenerator,
         "step": StepPatternLoadGenerator,
         "random": RandomLoadGenerator,
@@ -158,8 +157,23 @@ class LoadSchedule:
         values = generator.generate()
         return cls(values, step_size)
     
+    @classmethod
+    def from_config_file(cls, config_path: str, target_tps: int, time: int) -> "LoadSchedule":
+        """Load schedule from a YAML/JSON config file."""
+        import yaml
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+        
+        profile = config.pop("profile")
+        step_size = config.pop("step_size", 5)
+        
+        # Inject runtime values
+        config["target_tps"] = target_tps
+        config["time"] = time
+        
+        return cls.from_generator(profile, step_size, **config)
+    
     def get_tps(self, elapsed_seconds: float) -> int:
-        """Get the TPS value for the given elapsed time."""
         index = int(elapsed_seconds // self.step_size)
         if index < 0:
             return self.values[0]
@@ -168,11 +182,9 @@ class LoadSchedule:
         return self.values[index]
     
     def total_duration(self) -> int:
-        """Total duration of the schedule in seconds."""
         return len(self.values) * self.step_size
     
     def __iter__(self):
-        """Iterate over (start_time, tps) tuples."""
         for i, tps in enumerate(self.values):
             yield i * self.step_size, tps
     

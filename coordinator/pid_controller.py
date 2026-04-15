@@ -1,9 +1,11 @@
 from dataclasses import dataclass
+
 from styx.common.logging import logging
+
 
 @dataclass
 class BacklogPIDController:
-    kp: float = 1
+    kp: float = 0.1
     ki: float = 0.001
     kd: float = 0.1
     d_smoothing: float = 0.6 # EMA alpha for derivative
@@ -43,7 +45,7 @@ class BacklogPIDController:
             + (1 - self.d_smoothing) * self.smoothed_derivative
         )
         d_term = self.kd * self.smoothed_derivative
-        
+
 
         self.prev_error = error
         logging.warning(f"CONTROLLER | P term: {p_term}, I term: {i_term}, D term: {d_term}")

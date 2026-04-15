@@ -851,7 +851,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Rate of incoming load across the entire system ",
+      "description": "Rate of how many requests the workers consume from kafka (per second). This metric tries to approximate the input rate that is coming into styx, although it can be inaccurate when there is migration/slow epochs, as it will produce artificial spikes due to the workers consuming a lot more records in order to catch up.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -933,12 +933,12 @@
         {
           "editorMode": "code",
           "expr": "sum(rate(input_rate_counter_total[15s]))",
-          "legendFormat": "Total Input Rate",
+          "legendFormat": "Total Worker Consumption Rate",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Input Rate",
+      "title": "Consumption Rate",
       "type": "timeseries"
     },
     {
@@ -1291,6 +1291,100 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
+      "description": "Amount of active workers participating in the protocol",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 15
+      },
+      "id": 26,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "live_worker_count",
+          "legendFormat": "Worker count",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Worker count",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1348,9 +1442,9 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 0,
+        "h": 6,
+        "w": 6,
+        "x": 6,
         "y": 15
       },
       "id": 13,
@@ -1443,9 +1537,9 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 8,
+        "h": 6,
+        "w": 6,
+        "x": 12,
         "y": 15
       },
       "id": 17,
@@ -1562,9 +1656,9 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
+        "h": 6,
+        "w": 6,
+        "x": 18,
         "y": 15
       },
       "id": 6,
@@ -1671,7 +1765,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 23
+        "y": 21
       },
       "id": 19,
       "options": {
@@ -1766,7 +1860,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 23
+        "y": 21
       },
       "id": 20,
       "options": {
@@ -1866,7 +1960,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 23
+        "y": 21
       },
       "id": 21,
       "options": {
@@ -1945,7 +2039,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               },
               {
                 "color": "orange",
@@ -1965,7 +2060,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 31
+        "y": 29
       },
       "id": 9,
       "options": {
@@ -2057,7 +2152,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               },
               {
                 "color": "orange",
@@ -2077,7 +2173,7 @@
         "h": 4,
         "w": 4,
         "x": 4,
-        "y": 31
+        "y": 29
       },
       "id": 7,
       "options": {
@@ -2143,7 +2239,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               },
               {
                 "color": "red",
@@ -2158,7 +2255,7 @@
         "h": 6,
         "w": 8,
         "x": 8,
-        "y": 31
+        "y": 29
       },
       "id": 18,
       "options": {
@@ -2242,7 +2339,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               },
               {
                 "color": "red",
@@ -2258,7 +2356,7 @@
         "h": 6,
         "w": 8,
         "x": 16,
-        "y": 31
+        "y": 29
       },
       "id": 16,
       "options": {
@@ -2321,7 +2419,7 @@
         "h": 5,
         "w": 8,
         "x": 0,
-        "y": 35
+        "y": 33
       },
       "id": 11,
       "options": {
@@ -2385,6 +2483,6 @@
   "timezone": "browser",
   "title": "Styx System Overview",
   "uid": "beckc0nxpeupsf",
-  "version": 12,
+  "version": 17,
   "weekStart": ""
 }

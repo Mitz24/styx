@@ -53,6 +53,15 @@ echo "autoscaling_enabled: $autoscaling_enabled"
 echo "workload_profile: $workload_profile"
 echo "==================================================="
 
+case "$workload_profile" in
+    constant|increasing|decreasing|random|cosine|step) ;;
+    *)
+        echo "ERROR: Unknown workload profile: $workload_profile"
+        exit 1
+        ;;
+esac
+load_config_path="demo/load_profiles/$workload_profile.yaml"
+
 # Use kubefwd to forward all services in the namespace.
 # kubefwd adds /etc/hosts entries for service names and pod FQDNs, which is
 # required for Kafka: kubectl port-forward alone causes advertised-listener
@@ -89,13 +98,13 @@ fi
 if [[ $workload_name == "ycsbt" ]]; then
     # YCSB-T
     run_with_validation=false
-    python demo/demo-ycsb/client.py "$client_threads" "$n_keys" "$n_part" "$zipf_const" "$input_rate" "$total_time" "$saving_dir" "$warmup_seconds" "$run_with_validation" "$epoch_size" "$workload_profile" "$autoscaling_enabled" "$kill_at"
+    python demo/demo-ycsb/client.py "$client_threads" "$n_keys" "$n_part" "$zipf_const" "$input_rate" "$total_time" "$saving_dir" "$warmup_seconds" "$run_with_validation" "$epoch_size" "$load_config_path" "$autoscaling_enabled" "$kill_at"
 elif [[ $workload_name == "dhr" ]]; then
     # Deathstar Hotel Reservation
-    python demo/demo-deathstar-hotel-reservation/pure_kafka_demo.py "$saving_dir" "$client_threads" "$n_part" "$input_rate" "$total_time" "$warmup_seconds" "$epoch_size" "$workload_profile" "$autoscaling_enabled" "$kill_at"
+    python demo/demo-deathstar-hotel-reservation/pure_kafka_demo.py "$saving_dir" "$client_threads" "$n_part" "$input_rate" "$total_time" "$warmup_seconds" "$epoch_size" "$load_config_path" "$autoscaling_enabled" "$kill_at"
 elif [[ $workload_name == "dmr" ]]; then
     # Deathstar Movie Review
-    python demo/demo-deathstar-movie-review/pure_kafka_demo.py "$saving_dir" "$client_threads" "$n_part" "$input_rate" "$total_time" "$warmup_seconds" "$epoch_size" "$workload_profile" "$autoscaling_enabled" "$kill_at"
+    python demo/demo-deathstar-movie-review/pure_kafka_demo.py "$saving_dir" "$client_threads" "$n_part" "$input_rate" "$total_time" "$warmup_seconds" "$epoch_size" "$load_config_path" "$autoscaling_enabled" "$kill_at"
 elif [[ $workload_name == "tpcc" ]]; then
     # TPC-C
     DATA_DIR="demo/demo-tpc-c/data_${n_keys}"
@@ -125,7 +134,7 @@ elif [[ $workload_name == "tpcc" ]]; then
     python demo/demo-tpc-c/pure_kafka_demo.py \
         "$saving_dir" "$client_threads" "$n_part" \
         "$input_rate" "$total_time" "$warmup_seconds" \
-        "$n_keys" "$enable_compression" "$use_composite_keys" "$use_fallback_cache" "$epoch_size" "$workload_profile" "$autoscaling_enabled" "$kill_at"
+        "$n_keys" "$enable_compression" "$use_composite_keys" "$use_fallback_cache" "$epoch_size" "$load_config_path" "$autoscaling_enabled" "$kill_at"
 else
     echo "Benchmark not supported!"
 fi

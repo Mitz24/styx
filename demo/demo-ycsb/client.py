@@ -54,7 +54,7 @@ if not os.path.exists(SAVE_DIR):
 warmup_seconds: int = int(sys.argv[8])
 run_with_validation = sys.argv[9].lower() == "true"
 epoch_size = int(sys.argv[10])
-workload_profile: str = sys.argv[11]
+load_config_path: str = sys.argv[11]
 autoscaling_enabled: bool = sys.argv[12].lower() == "true"
 kill_at: int = int(sys.argv[13]) if len(sys.argv) > 13 else -1
 ####################################################################################################################
@@ -64,42 +64,11 @@ g = StateflowGraph("ycsb-benchmark",
 ycsb_operator.set_n_partitions(N_PARTITIONS)
 g.add_operators(ycsb_operator)
 
-step_size = 5  # in seconds
-
-if workload_profile == "constant":
-    load_schedule = LoadSchedule.from_generator(
-        "constant", step_size,
-        target_tps=messages_per_second,
-        time=seconds
-    )
-elif workload_profile in ("increase", "decrease", "random"):
-    load_schedule = LoadSchedule.from_generator(
-        workload_profile, step_size,
-        target_tps=messages_per_second,
-        time=seconds,
-        magnitude=5000
-    )
-elif workload_profile == "cosine":
-    load_schedule = LoadSchedule.from_generator(
-        "cosine", step_size,
-        target_tps=messages_per_second,
-        time=seconds,
-        cosine_period=30,
-        mean_input_rate=messages_per_second,
-        max_divergence=1500,
-        max_noise=50
-    )
-elif workload_profile == "step":
-    load_schedule = LoadSchedule.from_generator(
-        "step", step_size,
-        target_tps=messages_per_second,
-        time=seconds,
-        initial_round_length=40,
-        regular_round_length=60,
-        round_rates=[1000, 2000, 7000, 4000]
-    )
-else:
-    raise ValueError(f"Unknown workload profile: {workload_profile}")
+load_schedule = LoadSchedule.from_config_file(
+    load_config_path, 
+    target_tps=messages_per_second,
+    time=seconds
+)
 
 def submit_graph(styx: SyncStyxClient):
     print(f"Partitions: {list(g.nodes.values())[0].n_partitions}")
