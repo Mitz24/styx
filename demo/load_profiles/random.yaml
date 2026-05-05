@@ -1,3 +1,4 @@
 profile: random
 step_size: 5
-magnitude: 5000
+magnitude: 500
+seed: 102

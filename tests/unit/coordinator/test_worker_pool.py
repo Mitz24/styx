@@ -233,7 +233,7 @@ class TestWorkerPoolQueries:
         pool.register_worker("127.0.0.1", 5001, 6001, False)
         op = _mock_operator()
         pool.schedule_operator_partition(("users", 0), op)  # w1 gets it
-        standby = pool.get_standby_workers()
+        standby = pool.get_non_participating_workers()
         assert all(not w.participating for w in standby)
 
     def test_get_participating_workers(self):

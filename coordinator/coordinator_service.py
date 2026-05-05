@@ -279,11 +279,14 @@ class CoordinatorService:
         # Scaling policy parameters
         self.enable_autoscale: bool = bool(strtobool(os.getenv("ENABLE_AUTOSCALE", "true")))
         self.scale_up_cpu_threshold: float = 70.0
-        self.scale_cooldown_period: float = 30.0
+        self.scale_cooldown_period: float = 15.0
+        self.capacity_confidence_threshold: float = 0.25
+        self.downscale_safety_factor: float = 0.8
+        self._pending_downscale: bool = False
         self.last_scale_action_time: float = 0.0
-        self.scaled_once: bool = False  # TEMPORARY
         self.scale_window_seconds: int = 5
         self.cpu_metric_window: SlidingWindowMetric = SlidingWindowMetric(self.scale_window_seconds)
+        self.migration_time_window: SlidingWindowMetric = SlidingWindowMetric(5)
 
         self.pid_controller = BacklogPIDController()
         # Per-epoch accumulators: populated as each worker reports, consumed when all have synced
@@ -297,8 +300,9 @@ class CoordinatorService:
         self.tps_sliding_window: SlidingWindowMetric = SlidingWindowMetric(self.tps_window_seconds)
         self.system_capacity_estimator: SystemCapacityEstimator = SystemCapacityEstimator(
             sequence_max_size=SEQUENCE_MAX_SIZE,
-            window_size=50,
         )
+        self._capacity_ewma: float | None = None
+        self._capacity_ewma_alpha: float = 0.3  # smoothing factor (0→slow, 1→no smoothing)
 
         # Chronos forecaster (background process)
         self.total_keys_accum: int = 0
@@ -328,14 +332,18 @@ class CoordinatorService:
             return
 
         # 1) Build an updated graph (same topology, updated partition count)
+        # Ensure we never reduce partitions below the current count (Kafka can't shrink partitions)
+        current_partitions = self.coordinator.submitted_graph.max_operator_parallelism
+        effective_n_partitions = max(new_n_partitions, current_partitions)
+        
         new_graph = deepcopy(self.coordinator.submitted_graph)
-        new_graph.max_operator_parallelism = new_n_partitions
+        new_graph.max_operator_parallelism = effective_n_partitions
         for _op_name, op in iter(new_graph):
             # Scale all operators uniformly for now (fits YCSB demo; can be extended per-operator later)
             if hasattr(op, "set_n_partitions"):
-                op.set_n_partitions(new_n_partitions)
+                op.set_n_partitions(effective_n_partitions)
             else:
-                op.n_partitions = new_n_partitions
+                op.n_partitions = effective_n_partitions
 
         # 2) Gracefully stop the transactional protocol in the next epoch
         self.migration_in_progress = True
@@ -343,16 +351,17 @@ class CoordinatorService:
         if self.aria_metadata is not None:
             self.aria_metadata.stop_in_next_epoch()
 
-        # 3) Activate the new workers
+        # 3) Activate the new workers 
+        activation_time = timer()
         for _ in range(new_worker_num):
-            worker = self.coordinator.worker_pool.activate_standby_worker()
+            worker = self.coordinator.worker_pool.activate_standby_worker(current_time=activation_time)
             if worker is None:
                 logging.error("No standby workers available to activate")
                 break
             logging.warning(f"Activated standby worker_id: {worker.worker_id}")
 
         # 3.5) Expand Kafka topic partitions to match the new partition count
-        await self.coordinator.expand_kafka_topic_partitions(new_graph, new_n_partitions)
+        await self.coordinator.expand_kafka_topic_partitions(new_graph, effective_n_partitions)
         # Allow time for Kafka metadata to propagate to brokers and workers
         await asyncio.sleep(2)
 
@@ -362,10 +371,65 @@ class CoordinatorService:
         # 5) Kick off the existing migration pipeline (state repartition + transfer + resume)
         self.migration_metadata = MigrationMetadata(len(self.coordinator.worker_pool.get_participating_workers()))
         logging.warning(
-            f"SCALE_UP | starting migration | new_n_partitions={new_n_partitions} "
+            f"SCALE_UP | starting migration | new_n_partitions={effective_n_partitions} "
+            f"workers_live={len(self.coordinator.worker_pool.get_live_workers())} "
+            f"workers_participating={len(self.coordinator.worker_pool.get_participating_workers())} "
+            f"new graph={new_graph}"
+        )
+        await self.coordinator.update_stateflow_graph(new_graph)
+        start_time = time.time_ns()
+        self.migration_start_time_gauge.set(start_time / 1_000_000)
+        self.migration_start_time = start_time
+        self.migration_start_count.inc()
+
+    async def scale_down(self, new_n_partitions: int) -> None:
+        """Scale down the cluster by reducing partition count and deactivating idle workers.
+        
+        After migration completes, workers with no assigned partitions will be
+        moved back to standby via the _pending_downscale flag.
+        """
+        if self.migration_in_progress:
+            logging.warning("ScaleDown requested but a migration is already in progress.")
+            return
+        if not self.coordinator.graph_submitted or self.coordinator.submitted_graph is None:
+            logging.warning("ScaleDown requested but no graph is currently submitted.")
+            return
+
+        current_partitions = self.coordinator.submitted_graph.max_operator_parallelism
+        if new_n_partitions <= 0:
+            logging.warning(f"ScaleDown requested with invalid new_n_partitions={new_n_partitions}")
+            return
+        if new_n_partitions >= current_partitions:
+            logging.warning(
+                f"ScaleDown requested but new_n_partitions={new_n_partitions} >= current={current_partitions}"
+            )
+            return
+
+        # 1) Build an updated graph with fewer partitions
+        new_graph = deepcopy(self.coordinator.submitted_graph)
+        new_graph.max_operator_parallelism = new_n_partitions
+        for _op_name, op in iter(new_graph):
+            if hasattr(op, "set_n_partitions"):
+                op.set_n_partitions(new_n_partitions)
+            else:
+                op.n_partitions = new_n_partitions
+
+        # 2) Gracefully stop the transactional protocol
+        self.migration_in_progress = True
+        self._pending_downscale = True
+        await self.stop_snapshotting()
+        if self.aria_metadata is not None:
+            self.aria_metadata.stop_in_next_epoch()
+
+        # 3) Reschedule partitions -- with fewer partitions, some workers get 0
+        self.coordinator.reschedule_all_partitions_round_robin(new_graph)
+
+        # 4) Kick off the migration pipeline
+        self.migration_metadata = MigrationMetadata(len(self.coordinator.worker_pool.get_participating_workers()))
+        logging.warning(
+            f"SCALE_DOWN | starting migration | new_n_partitions={new_n_partitions} "
             f"workers_live={len(self.coordinator.worker_pool.get_live_workers())} "
             f"workers_participating={len(self.coordinator.worker_pool.get_participating_workers())}"
-            f"new graph={new_graph}"
         )
         await self.coordinator.update_stateflow_graph(new_graph)
         start_time = time.time_ns()
@@ -792,18 +856,10 @@ class CoordinatorService:
                 worker_epoch_stats,
             )
 
-            cpu_work_ms = (
-                worker_epoch_stats.func_time
-                + worker_epoch_stats.conflict_res_time
-                + worker_epoch_stats.commit_time
-                + worker_epoch_stats.fallback_time
-            )
-            overhead_ms = worker_epoch_stats.epoch_latency - cpu_work_ms
             self.system_capacity_estimator.record(
                 worker_id,
-                worker_epoch_stats.committed_txns,
-                cpu_work_ms,
-                overhead_ms,
+                worker_epoch_stats.total_txns,
+                worker_epoch_stats.epoch_latency,
             )
 
             # Feed the Chronos metric buffer
@@ -836,54 +892,126 @@ class CoordinatorService:
             if self.enable_autoscale and not self.migration_in_progress:
                 smoothed_tps = self.tps_sliding_window.average() or 0.0
                 pid_output = self.pid_controller.compute(total_backlog, smoothed_tps)
-                logging.warning(
-                    f"PID | output={pid_output:.3f} backlog={total_backlog} "
-                    f"tps={total_tps:.0f} smoothed_tps={smoothed_tps:.0f}"
-                )
                 if pid_output >= self.pid_controller.scale_up_threshold and not (
-                    time.time() - self.last_scale_action_time < self.scale_cooldown_period or self.scaled_once
+                    time.time() - self.last_scale_action_time < self.scale_cooldown_period
                 ):
-                    self.scaled_once = True
-                    to_add = 1
+                    to_add = self._resolve_scale_up_workers(1)
+                    if to_add == 0:
+                        logging.warning(f"PID | no standby workers available, skipping scale up")
+                        return
                     new_partition_num = len(self.coordinator.worker_pool.get_participating_workers()) + to_add
                     await self.scale_up(new_partition_num, to_add)
                     self.last_scale_action_time = time.time()
 
     def _estimate_migration_time(self, total_keys: int) -> float:
-        return (total_keys * self.epoch_duration_window.average() / ASYNC_MIGRATION_BATCH_SIZE) / 1000.0
+        estimated_migration_time = (total_keys * self.epoch_duration_window.average() / ASYNC_MIGRATION_BATCH_SIZE) / 1000.0
+        self.migration_time_window.add(estimated_migration_time)
+        return self.migration_time_window.average()
+    
+    def _resolve_scale_up_workers(self, to_add: int) -> int:
+        """Scale up only activates workers from _standby_queue; clamp and skip if none left.
+        Returns the number of workers to add.
+        """
+        n_standby = self.coordinator.worker_pool.pending_standby_worker_count()
+        if n_standby == 0:
+            logging.warning(f"SCALE UP | no standby workers available")
+            return 0
+        if to_add > n_standby:
+            logging.warning(f"SCALE UP | not enough standby workers clamping to {n_standby} workers")
+            return n_standby
+        return to_add
 
     def _compute_predictive_scaling(self, predictions: dict[str, list[float]]) -> tuple[bool, int]:
         """Compare the Chronos forecast against the capacity model.
         Returns (should_scale, workers_to_add).
         """
-        n_workers = len(self.coordinator.worker_pool.get_participating_workers())
-        system_capacity = self.system_capacity_estimator.estimate_system_capacity()
-        if system_capacity is None:
+        # Check confidence before using capacity estimate
+        confidence = self.system_capacity_estimator.confidence
+        if confidence < self.capacity_confidence_threshold:
+            logging.warning(f"PREDICTIVE | low confidence={confidence:.2f}")
             return False, 0
-        # Use the 0.9 quantile (pessimistic) to TRIGGER scaling
+        
+        n_workers = len(self.coordinator.worker_pool.get_live_workers())
+        raw_capacity = self.system_capacity_estimator.estimate_system_capacity()
+        if raw_capacity is None:
+            return False, 0
+        if self._capacity_ewma is None:
+            self._capacity_ewma = raw_capacity
+        else:
+            self._capacity_ewma += self._capacity_ewma_alpha * (raw_capacity - self._capacity_ewma)
+        system_capacity = self._capacity_ewma
         peak_p90 = max(predictions.get("0.9", [0.0]))
-        # Use the 0.5 quantile (median) to SIZE the scale-up
-        peak_p50 = max(predictions.get("0.5", [0.0]))
+        peak_p75 = max(predictions.get("0.75", [0.0]))
         headroom_factor = 1
         effective_capacity = system_capacity * headroom_factor
         logging.warning(
-            f"PREDICTIVE | peak_p90={peak_p90:.0f}  peak_p50={peak_p50:.0f}  "
-            f"capacity={system_capacity:.0f}  effective={effective_capacity:.0f}"
+            f"PREDICTIVE | confidence={confidence:.2f} | peak_p90={peak_p90:.0f} peak_p75={peak_p75:.0f} | "
+            f"raw_capacity={raw_capacity:.0f} | smoothed_capacity={system_capacity:.0f} | effective={effective_capacity:.0f}"
         )
-        if peak_p50 <= effective_capacity:
+        if peak_p75 <= effective_capacity:
             return False, 0
         per_worker_capacity = system_capacity / max(n_workers, 1)
         n_needed = max(
             n_workers + 1,
-            int(peak_p50 / (per_worker_capacity * headroom_factor)) + 1,
+            int(peak_p75 / (per_worker_capacity * headroom_factor)) + 1,
         )
         # Don't more than double the cluster in one step
         to_add = min(n_needed - n_workers, n_workers)
+        if to_add <= 0:
+            return False, 0
+        # scale_up only activates workers from _standby_queue; clamp and skip if none left
+        to_add = self._resolve_scale_up_workers(to_add)
+        if to_add == 0:
+            return False, 0
         logging.warning(
             f"PREDICTIVE | SCALE UP: need {n_needed} workers "
             f"(currently {n_workers}, adding {to_add})"
         )
         return True, to_add
+
+    def _compute_predictive_downscaling(
+        self, predictions: dict[str, list[float]] | None
+    ) -> tuple[bool, int]:
+        """Check if the system can serve predicted demand with fewer workers.
+        Returns (should_downscale, workers_to_remove).
+        """
+        n_workers = len(self.coordinator.worker_pool.get_live_workers())
+        if n_workers <= 1:
+            return False, 0
+
+        # Same confidence gate as upscaling
+        confidence = self.system_capacity_estimator.confidence
+        if confidence < self.capacity_confidence_threshold:
+            return False, 0
+
+        # Backlog must be zero before considering downscale
+        total_backlog = sum(self.epoch_backlog_accum.values())
+        if total_backlog > 0:
+            return False, 0
+
+        system_capacity = self._capacity_ewma
+        if system_capacity is None:
+            return False, 0
+        per_worker_cap = system_capacity / n_workers
+
+        # Determine peak expected demand (pessimistic: use current rate and p90 forecast)
+        current_rate = self.tps_sliding_window.average() or 0.0
+        peak_demand = current_rate
+        if predictions:
+            p90_peak = max(predictions.get("0.9", [0.0]))
+            peak_demand = max(peak_demand, p90_peak)
+
+        # Can (n-1) workers handle peak demand with headroom?
+        reduced_capacity = per_worker_cap * (n_workers - 1)
+        if peak_demand < reduced_capacity * self.downscale_safety_factor:
+            logging.warning(
+                f"PREDICTIVE | SCALE DOWN: peak_demand={peak_demand:.0f} < "
+                f"reduced_capacity={reduced_capacity:.0f} * {self.downscale_safety_factor} = "
+                f"{reduced_capacity * self.downscale_safety_factor:.0f} | removing 1 worker"
+            )
+            return True, 1
+
+        return False, 0
 
     async def chronos_forecast_loop(self) -> None:
         """Periodically submit metric snapshots to the Chronos forecaster
@@ -901,12 +1029,11 @@ class CoordinatorService:
             estimated_migration_time = self._estimate_migration_time(self.total_keys)
             logging.warning(f"Estimated migration time: {estimated_migration_time} seconds")
 
-            self.chronos_forecaster.submit(context, prediction_length=ceil(estimated_migration_time))
+            min_prediction_horizon = 10
+            self.chronos_forecaster.submit(context, prediction_length=max(min_prediction_horizon, ceil(estimated_migration_time)))
             predictions = self.chronos_forecaster.poll()
+            logging.warning(f"CHRONOS | predictions: {predictions}")
             if predictions and self.enable_autoscale and not self.migration_in_progress:
-                logging.warning(
-                    f"CHRONOS | predictions: {predictions}"
-                )
                 should_scale, to_add = self._compute_predictive_scaling(predictions)
                 if should_scale and not (
                     time.time() - self.last_scale_action_time < self.scale_cooldown_period
@@ -916,6 +1043,17 @@ class CoordinatorService:
                     await self.scale_up(new_partition_num, to_add)
                     self.last_scale_action_time = time.time()
                     self.live_worker_count_gauge.set(len(self.coordinator.worker_pool.get_live_workers()))
+                elif not should_scale:
+                    # Check for downscaling opportunity if we didn't scale up
+                    should_downscale, to_remove = self._compute_predictive_downscaling(predictions)
+                    if should_downscale and not (
+                        time.time() - self.last_scale_action_time < self.scale_cooldown_period
+                    ):
+                        n_workers = len(self.coordinator.worker_pool.get_participating_workers())
+                        new_partition_num = n_workers - to_remove
+                        await self.scale_down(new_partition_num)
+                        self.last_scale_action_time = time.time()
+                        self.live_worker_count_gauge.set(len(self.coordinator.worker_pool.get_live_workers()))
 
     def _record_epoch_metrics(
         self,
@@ -1027,6 +1165,19 @@ class CoordinatorService:
             )
             await self.migration_metadata.cleanup(mt)
             self.migration_in_progress = False
+
+            # Deactivate workers that ended up with no partitions after scale-down
+            if self._pending_downscale:
+                non_participating_workers = self.coordinator.worker_pool.get_non_participating_workers()
+                logging.warning(
+                    f"SCALE_DOWN | deactivating {len(non_participating_workers)} idle workers after migration"
+                )
+                for worker in non_participating_workers:
+                    deactivated = self.coordinator.worker_pool.deactivate_to_standby(worker.worker_id)
+                    if deactivated:
+                        self.system_capacity_estimator.remove_worker(worker.worker_id)
+                self._pending_downscale = False
+                self.live_worker_count_gauge.set(len(self.coordinator.worker_pool.get_live_workers()))
 
             logging.warning("Restarting the snapshotting mechanism")
             self.snapshotting_task = asyncio.create_task(self.send_snapshot_marker())

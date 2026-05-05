@@ -680,6 +680,11 @@ class AriaProtocol(BaseTransactionalProtocol):
         io_wait_utilization = (io_wait_time_ms / epoch_latency) if epoch_latency > 0 else 0.0
         key_counts = sum(len(data) for data in self.local_state.data.values())
 
+        logging.warning(f"Epoch throughput: {epoch_throughput} | total txns: {total_txns}")
+        logging.warning(f"Queue backlog: {len(self.sequencer.distributed_log)}")
+        if total_txns > 0:
+            logging.warning(f"Per txn cost: {epoch_latency / total_txns} ms")
+
         worker_epoch_stats = WorkerEpochStats(
             worker_id=self.id,
             epoch_throughput=epoch_throughput,
@@ -736,7 +741,7 @@ class AriaProtocol(BaseTransactionalProtocol):
                 and seq_item.payload.partition != self.local_state.keys_to_workers[seq_item.payload.key]
             ):
                 new_partition = self.local_state.keys_to_workers[seq_item.payload.key]
-                logging.warning(
+                logging.debug(
                     f"Key {seq_item.payload.key} needs redirect: "
                     f"partition {seq_item.payload.partition} -> {new_partition}"
                 )

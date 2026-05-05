@@ -20,8 +20,8 @@ fi
 
 if [[ "$DEPLOY_MODE" == "k8s-minikube" ]]; then
   echo "Removing images from minikube..."
-  minikube image rm "${COORDINATOR_IMAGE}:${TAG}"
-  minikube image rm "${WORKER_IMAGE}:${TAG}"
+  #minikube image rm "${COORDINATOR_IMAGE}:${TAG}"
+  #minikube image rm "${WORKER_IMAGE}:${TAG}"
 fi
 
 echo "Done."

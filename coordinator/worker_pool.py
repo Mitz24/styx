@@ -58,7 +58,7 @@ class WorkerPool:
         self.orphaned_operator_assignments: dict[OperatorPartition, Operator] = {}
 
     def get_live_workers(self) -> list[Worker]:
-        """Returns all currently known (non-tombstoned) workers"""
+        """Returns all currently known (non-tombstoned) workers. Does NOT include standby workers."""
         live: list[Worker] = []
         for _, _, worker in self._queue:
             if worker == self._tombstone:
@@ -218,13 +218,40 @@ class WorkerPool:
         entry[-1] = self._tombstone
         return worker
 
-    def activate_standby_worker(self) -> Worker:
+    def activate_standby_worker(self, current_time: float | None = None) -> Worker:
+        """Activate a standby worker and move it to the active pool """
         if not self._standby_queue:
             return None
         worker: Worker = self._standby_queue.popleft()
         self.standby_worker_ids.remove(worker.worker_id)
+        # Set previous_heartbeat to current time so the newly activated worker
+        # has a grace period before failing heartbeat checks. Without this,
+        # the default value (1_000_000.0) may be too far in the past if the
+        # coordinator has been running for a while (timer() > 1_000_000).
+        if current_time is not None:
+            worker.previous_heartbeat = current_time
         self.put(worker)
         return worker
+
+    def deactivate_to_standby(self, worker_id: int) -> Worker | None:
+        """Move a non-participating worker from the active heap back to standby"""
+        if worker_id not in self._worker_queue_idx:
+            return None
+        worker = self.peek(worker_id)
+        if worker.participating:
+            logging.warning(
+                f"Cannot deactivate worker {worker_id}: still has {len(worker.assigned_operators)} partitions"
+            )
+            return None
+        worker = self.remove_worker(worker_id)
+        self._standby_queue.append(worker)
+        self.standby_worker_ids.add(worker_id)
+        logging.warning(f"Deactivated worker {worker_id} to standby")
+        return worker
+
+    def pending_standby_worker_count(self) -> int:
+        """Standbys not yet moved into the scheduling heap (see activate_standby_worker)."""
+        return len(self._standby_queue)
 
     def is_worker_active(self, worker_id: int) -> bool:
         return (
@@ -236,7 +263,7 @@ class WorkerPool:
     def number_of_workers(self) -> int:
         return len(self._queue)
 
-    def get_standby_workers(self) -> list[Worker]:
+    def get_non_participating_workers(self) -> list[Worker]:
         return [worker for _, _, worker in self._queue if worker != self._tombstone and not worker.participating]
 
     def get_participating_workers(self) -> list[Worker]:

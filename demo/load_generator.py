@@ -14,10 +14,13 @@ class LoadGenerator(ABC):
 
 
 class RandomLoadGenerator(LoadGenerator):
-    def __init__(self, target_tps: int, time: int, magnitude: int, max_threshold: int | None = None):
+    def __init__(self, target_tps: int, time: int, magnitude: int, max_threshold: int | None = None, seed: int | None = None):
         super().__init__(time, max_threshold)
         self.target_tps = target_tps
         self.magnitude = magnitude
+        self.seed = seed
+        if self.seed is not None:
+            random.seed(self.seed)
 
     def generate(self) -> list[int]:
         values = []
@@ -40,7 +43,7 @@ class IncreaseLoadGenerator(LoadGenerator):
         values = []
         val = self.target_tps
         for i in range(0, self.time):
-            val += random.randrange(int(-self.magnitude * (1 / 30)), int(self.magnitude * (1 / 22)))
+            val += random.randrange(int(-self.magnitude * (1 / 30)), int(self.magnitude * (1 / 15)))
             if self.max_threshold is not None and val > self.max_threshold:
                 val = self.max_threshold
             values.append(val)
@@ -112,12 +115,17 @@ class StepPatternLoadGenerator(LoadGenerator):
 
 
 class ConstantLoadGenerator(LoadGenerator):
-    def __init__(self, target_tps: int, time: int, max_threshold: int | None = None):
+    def __init__(self, target_tps: int, time: int, magnitude: int, max_threshold: int | None = None):
         super().__init__(time, max_threshold)
         self.target_tps = target_tps
+        self.magnitude = magnitude
     
     def generate(self) -> list[int]:
-        return [self.target_tps] * self.time
+        values = [] 
+        for _ in range(0, self.time):
+            value = self.target_tps + random.randrange(-self.magnitude, self.magnitude)
+            values.append(value)
+        return [abs(int(val)) for val in values]
 
 
 class LoadSchedule:

@@ -8,9 +8,11 @@ from typing import Any
 
 from chronos import Chronos2Pipeline
 import pandas as pd
+import torch
 
-MIN_CONTEXT_LENGTH: int = int(os.getenv("CHRONOS_MIN_CONTEXT", "3"))
+MIN_CONTEXT_LENGTH: int = 40
 CHRONOS_MODEL_PATH: str = "models/chronos-2"
+CHRONOS_NUM_THREADS: int = 2
 
 log = logging.getLogger("chronos_forecaster")
 
@@ -22,10 +24,14 @@ def _forecaster_loop(
     """Entry point for the forecaster child process."""
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s [CHRONOS] %(message)s")
 
+    # Configure PyTorch threading for optimal CPU inference
+    torch.set_num_threads(CHRONOS_NUM_THREADS)
+    torch.set_num_interop_threads(2)
+    log.warning("PyTorch configured with %d threads", CHRONOS_NUM_THREADS)
+
     log.warning("Loading Chronos model")
     load_start = time.time()
     try:
-
         pipeline = Chronos2Pipeline.from_pretrained(
             CHRONOS_MODEL_PATH,
             device_map="cpu",
@@ -47,10 +53,10 @@ def _forecaster_loop(
             prediction_length: int = req.get("prediction_length", 10)
             series = context_map["input_rate"]
             if len(series) < MIN_CONTEXT_LENGTH:
-                log.warning(f"CHRONOS | Not enough data to forecast")
+                log.warning("CHRONOS | Not enough data to forecast")
                 result_queue.put({
                     "predictions": {
-                        "0.5": [0.0] * prediction_length,
+                        "0.75": [0.0] * prediction_length,
                         "0.9": [0.0] * prediction_length,
                     },
                 })
@@ -66,12 +72,12 @@ def _forecaster_loop(
             predictions_df = pipeline.predict_df(
                 context_df,
                 prediction_length=prediction_length,
-                quantile_levels=[0.5, 0.9],
+                quantile_levels=[0.75, 0.9],
             )
 
             result_queue.put({
                 "predictions": {
-                    "0.5": predictions_df["0.5"].tolist(),
+                    "0.75": predictions_df["0.75"].tolist(),
                     "0.9": predictions_df["0.9"].tolist(),
                 },
             })

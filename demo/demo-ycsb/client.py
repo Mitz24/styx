@@ -147,7 +147,7 @@ def benchmark_runner(proc_num) -> dict[bytes, dict]:
         if lps < 1:
             time.sleep(1 - lps)
         sec_end2 = timer()
-        print(f"{second} | TPS: {current_tps} | Latency: {sec_end2 - sec_start:.3f}s")
+        print(f" {datetime.now()} | {second} | TPS: {current_tps} | Latency: {sec_end2 - sec_start:.3f}s")
 
     end = timer()
     print(f"Average latency per second: {(end - start) / seconds}")

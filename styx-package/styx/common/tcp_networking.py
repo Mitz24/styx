@@ -173,9 +173,11 @@ class SocketPool:
         return self
 
     def __next__(self) -> StyxSocketClient:
+        if not self.conns:
+            raise StopIteration("No connections available in pool")
         conn = self.conns[self.index]
         next_idx = self.index + 1
-        self.index = 0 if next_idx == self.size else next_idx
+        self.index = 0 if next_idx >= len(self.conns) else next_idx
         return conn
 
     async def create_socket_connections(self) -> None:
@@ -184,6 +186,7 @@ class SocketPool:
             success = await client.create_connection(self.host, self.port)
             if success:
                 self.conns.append(client)
+        logging.warning(f"SOCKET | Created {len(self.conns)} connections to {self.host}:{self.port}")
 
     async def close(self) -> None:
         for conn in self.conns:

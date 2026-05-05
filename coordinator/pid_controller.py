@@ -19,7 +19,7 @@ class BacklogPIDController:
     smoothed_derivative: float = 0.0
 
     def compute(self, total_backlog: float, smoothed_tps: float) -> float:
-        if smoothed_tps <= 0:
+        if smoothed_tps <= 0 or total_backlog <= 0:
             return 0.0
 
         normalized_backlog = total_backlog / smoothed_tps
