@@ -30,6 +30,7 @@ import contextlib
 
 from aiokafka import AIOKafkaConsumer, TopicPartition
 from aiokafka.errors import KafkaConnectionError, UnknownTopicOrPartitionError
+from styx.common.base_networking import SOCKET_RCV_BUF, SOCKET_SND_BUF
 from styx.common.local_state_backends import LocalStateBackend
 from styx.common.logging import logging
 from styx.common.message_types import MessageType
@@ -87,8 +88,8 @@ class Worker:
             struct.pack("ii", 1, 0),
         )  # Enable LINGER, timeout 0
         self.worker_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self.worker_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
-        self.worker_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+        self.worker_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_SND_BUF)
+        self.worker_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_RCV_BUF)
         self.worker_socket.bind(("0.0.0.0", self.server_port))  # noqa: S104
         self.worker_socket.setblocking(False)
 
@@ -99,16 +100,8 @@ class Worker:
             struct.pack("ii", 1, 0),
         )  # Enable LINGER, timeout 0
         self.protocol_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self.protocol_socket.setsockopt(
-            socket.SOL_SOCKET,
-            socket.SO_SNDBUF,
-            1024 * 1024,
-        )
-        self.protocol_socket.setsockopt(
-            socket.SOL_SOCKET,
-            socket.SO_RCVBUF,
-            1024 * 1024,
-        )
+        self.protocol_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_SND_BUF)
+        self.protocol_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_RCV_BUF)
         self.protocol_socket.bind(("0.0.0.0", self.protocol_port))  # noqa: S104
         self.protocol_socket.setblocking(False)
 
@@ -134,7 +127,6 @@ class Worker:
         self.function_execution_protocol: AriaProtocol | None = None
 
         self.aio_task_scheduler = AIOTaskScheduler()
-        self.protocol_task_scheduler = AIOTaskScheduler()
 
         self.async_snapshots: AsyncSnapshotsS3 | None = None
         self.protocol_task: asyncio.Task | None = None
@@ -876,19 +868,29 @@ class Worker:
 
     async def protocol_queue_worker(self) -> None:
         """
-        Worker that pulls protocol messages from the bounded queue and
-        hands them to the function_execution_protocol. This is where
-        backpressure terminates for the protocol path.
+        Worker that pulls protocol messages from the bounded queue and looks
+        up the matching handler inline.
+
+        Concurrency is bounded by `PROTOCOL_WORKERS`: each worker handles one
+        message at a time. Compared to dispatching through
+        `protocol_tcp_controller`, inlining the lookup saves one coroutine
+        allocation per message — measurable in py-spy at high tx/s.
+        Handlers with internal awaits (e.g. `_handle_unlock`) still get
+        drained by the other workers in the pool.
         """
         while True:
             message: bytes = await self.protocol_queue.get()
             try:
-                if self.function_execution_protocol is not None:
-                    self.protocol_task_scheduler.create_task(
-                        self.function_execution_protocol.protocol_tcp_controller(
-                            message,
-                        ),
-                    )
+                proto = self.function_execution_protocol
+                if proto is not None:
+                    msg_type = proto.networking.get_msg_type(message)
+                    handler = proto.protocol_handlers_map.get(msg_type)
+                    if handler is None:
+                        logging.error(
+                            f"Aria protocol: Non supported command message type: {msg_type}",
+                        )
+                    else:
+                        await handler(message)
                 else:
                     msg_type = self.protocol_networking.get_msg_type(message)
                     logging.debug(
