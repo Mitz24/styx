@@ -17,7 +17,7 @@ echo "minimum_amount_of_workers: $minimum_amount_of_workers"
 echo "enable_compression: $enable_compression"
 echo "use_composite_keys: $use_composite_keys"
 echo "enable_autoscale: $enable_autoscale"
-=======
+
 threaded_scale_factor=$(( (scale_factor + threads_per_worker - 1) / threads_per_worker ))
 # Enforce minimum
 (( threaded_scale_factor < minimum_amount_of_workers )) && threaded_scale_factor=$minimum_amount_of_workers
