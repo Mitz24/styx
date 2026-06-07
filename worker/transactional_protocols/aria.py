@@ -45,7 +45,7 @@ CONFLICT_DETECTION_METHOD: AriaConflictDetectionType = AriaConflictDetectionType
 )
 # if more than 10% aborts use fallback strategy
 FALLBACK_STRATEGY_PERCENTAGE: float = float(
-    os.getenv("FALLBACK_STRATEGY_PERCENTAGE", "-0.1"),
+    os.getenv("FALLBACK_STRATEGY_PERCENTAGE", "0.1"),
 )
 SNAPSHOTTING_THREADS: int = int(os.getenv("SNAPSHOTTING_THREADS", "4"))
 SEQUENCE_MAX_SIZE: int = int(os.getenv("SEQUENCE_MAX_SIZE", "1_000"))
@@ -132,7 +132,7 @@ class AriaProtocol(BaseTransactionalProtocol):
 
         self.egress: StyxKafkaBatchEgress = StyxKafkaBatchEgress(
             output_offsets,
-            restart_after_recovery or restart_after_migration,
+            restart_after_recovery,
         )
         # Primary task used for processing
         self.function_scheduler_task: asyncio.Task | None = None
@@ -234,13 +234,18 @@ class AriaProtocol(BaseTransactionalProtocol):
         await self.aio_task_scheduler.close()
         await self.background_functions.close()
         await self.snapshotting_networking_manager.close_all_connections()
-        self.function_scheduler_task.cancel()
-        self.communication_task.cancel()
+        # Guard against the standby code-path where function_scheduler_task
+        if self.function_scheduler_task is not None:
+            self.function_scheduler_task.cancel()
+        if self.communication_task is not None:
+            self.communication_task.cancel()
         if self.migration_sender_task is not None:
             self.migration_sender_task.cancel()
         try:
-            await self.function_scheduler_task
-            await self.communication_task
+            if self.function_scheduler_task is not None:
+                await self.function_scheduler_task
+            if self.communication_task is not None:
+                await self.communication_task
             if self.migration_sender_task is not None:
                 await self.migration_sender_task
         except asyncio.CancelledError:
@@ -258,15 +263,18 @@ class AriaProtocol(BaseTransactionalProtocol):
             logging.error(f"Task {task.get_name()} crashed: {e}\n{format_exc()}")
 
     def start(self) -> None:
-        self.function_scheduler_task = asyncio.create_task(self.function_scheduler())
-        self.function_scheduler_task.add_done_callback(self._task_exception_handler)
+        if self.registered_operators:
+            logging.warning(f"Aria protocol started with operator partitions: {list(self.registered_operators.keys())}")
+            self.function_scheduler_task = asyncio.create_task(self.function_scheduler())
+            self.function_scheduler_task.add_done_callback(self._task_exception_handler)
+        else:
+            logging.warning("Aria protocol started with no registered operators")
+            self.running = False
+            self.stopped.set()
         self.communication_task = asyncio.create_task(self.communication_protocol())
         self.communication_task.add_done_callback(self._task_exception_handler)
         if self.migrating_state and USE_ASYNC_MIGRATION:
             self.migration_sender_task = asyncio.create_task(self._continuous_migration_sender())
-        logging.warning(
-            f"Aria protocol started with operator partitions: {list(self.registered_operators.keys())}",
-        )
 
     async def run_function(
         self,
@@ -528,7 +536,7 @@ class AriaProtocol(BaseTransactionalProtocol):
     ) -> None:
         """Send a migration batch to destination workers in parallel."""
         send_tasks = []
-        logging.info(f"MIGRATION | Sending batch for migration: {batch}")
+        logging.info("MIGRATION | Sending batch for migration")
         for operator_partition, k_v_pairs in batch.items():
             operator_name, partition = operator_partition
             worker = self.dns[operator_name][partition]
@@ -745,7 +753,7 @@ class AriaProtocol(BaseTransactionalProtocol):
         io_wait_utilization = (io_wait_time_ms / epoch_latency) if epoch_latency > 0 else 0.0
         key_counts = sum(len(data) for data in self.local_state.data.values())
 
-        logging.warning(f"Epoch throughput: {epoch_throughput} | total txns: {total_txns}")
+        logging.warning(f"Epoch throughput: {epoch_throughput} | Latency: {epoch_latency} ms")
         logging.warning(f"Queue backlog: {len(self.sequencer.distributed_log)}")
         if total_txns > 0:
             logging.warning(f"Per txn cost: {epoch_latency / total_txns} ms")

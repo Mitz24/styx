@@ -1,60 +1,38 @@
 import ast
-import json
-from datetime import datetime, timezone
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import pandas as pd
-from matplotlib import rcParams
+from matplotlib.ticker import EngFormatter, MultipleLocator
 
-rcParams["figure.figsize"] = [14, 5]
-plt.rcParams.update({"font.size": 22})
+from plot_common import load_metadata, plot_migrations
+
+plt.rcParams.update({"font.size": 16})
+
+_SAVEFIG_KW = {"bbox_inches": "tight", "pad_inches": 0.05}
 
 
-def _load_metadata(
-    run_path: Path,
-    default_warmup_seconds: int = 10,
-    default_end_scale_sec: int = 10,
-) -> tuple[int, int | None, int | None]:
-    meta_path = run_path / "metadata.json"
-    if not meta_path.is_file():
-        return default_warmup_seconds, None, None
-
-    with meta_path.open("r") as f:
-        metadata = json.load(f)
-
-    warmup_seconds = int(metadata.get("warmup_seconds", default_warmup_seconds))
-    start_migration_ms_epoch = None
-    end_migration_ms_epoch = None
-
-    start_str = metadata.get("start")
-    manual_scale_sec = metadata.get("manual_scale_sec")
-    if start_str and manual_scale_sec is not None:
-        try:
-            start_dt = datetime.fromisoformat(start_str)
-            if start_dt.tzinfo is None:
-                start_dt = start_dt.replace(tzinfo=timezone.utc)
-            start_ms = int(start_dt.timestamp() * 1000)
-            start_migration_ms_epoch = int(manual_scale_sec) #start_ms + int(manual_scale_sec) * 1000
-            end_migration_ms_epoch = (
-                start_migration_ms_epoch + default_end_scale_sec
-            )
-        except ValueError:
-            pass
-
-    return warmup_seconds, start_migration_ms_epoch, end_migration_ms_epoch
+def _throughput_tick_step(max_tps: float) -> float:
+    if max_tps <= 100:
+        return 10
+    if max_tps <= 1000:
+        return 100
+    if max_tps <= 10000:
+        return 2000
+    return 5000
 
 
 def plot_throughput(
     run_path: Path,
     *,
-    ax: plt.Axes | None = None,
+    axes: plt.Axes | None = None,
     interval_size: int = 1,
-    save_path: Path | None = None,
+    x_max_seconds: float | None = None,
+    save_path: Path | str | None = None,
     show: bool = False,
 ) -> tuple[plt.Figure, plt.Axes]:
     run_path = Path(run_path)
-    warmup_seconds, _, _ = _load_metadata(run_path)
+    warmup_seconds, migrations = load_metadata(run_path)
 
     # Load CSVs
     input_df = pd.read_csv(run_path / "client_requests.csv")
@@ -97,36 +75,70 @@ def plot_throughput(
     throughput_df = pd.merge(
         throughput_in_df, throughput_out_df, on="time_bucket", how="outer"
     ).fillna(0)
-
     # Shift x-axis to start from 0 post-warmup
     throughput_df["time_bucket_shifted"] = throughput_df["time_bucket"] - warmup_seconds
 
-    if ax is None:
-        fig, ax = plt.subplots()
+    if x_max_seconds is not None:
+        throughput_df = throughput_df[
+            throughput_df["time_bucket_shifted"] <= x_max_seconds
+        ].copy()
+
+    if axes is None:
+        fig, ax = plt.subplots(
+            1,
+            1,
+            sharex=True,
+            figsize=(12, 6),
+        )
     else:
+        ax = axes
         fig = ax.figure
 
-    # Plot throughput
     ax.plot(
         throughput_df["time_bucket_shifted"],
         throughput_df["throughput_in"],
-        label="Input Throughput",
+        color="C0",
         linewidth=3,
+        alpha=0.8,
+        label="Input Rate (req/s)",
     )
     ax.plot(
         throughput_df["time_bucket_shifted"],
         throughput_df["throughput_out"],
-        label="Output Throughput",
+        color="C1",
         linewidth=3,
-        alpha=0.8,
+        linestyle="--",
+        alpha=1,
+        label="Output TPS",
     )
+
     ax.set_xlabel("Time (s)")
-    ax.grid(linestyle="dotted", linewidth=1.5, axis="y")
     ax.set_ylabel("Throughput (TPS)")
+    ax.yaxis.set_major_formatter(EngFormatter(sep=""))
+    ax.grid(linestyle="dotted", linewidth=1.5, axis="y")
+
+    max_in = float(throughput_df["throughput_in"].max()) if not throughput_df.empty else 0.0
+    max_out = float(throughput_df["throughput_out"].max()) if not throughput_df.empty else 0.0
+    max_tps = max(max_in, max_out, 1.0)
+    y_padding = max(max_tps * 0.1, _throughput_tick_step(max_tps))
+    ax.yaxis.set_major_locator(MultipleLocator(_throughput_tick_step(max_tps)))
+
+    if throughput_df.empty:
+        x_right = float(x_max_seconds) if x_max_seconds is not None else 1.0
+    elif x_max_seconds is not None:
+        x_right = float(x_max_seconds)
+    else:
+        x_right = float(throughput_df["time_bucket_shifted"].max())
+    ax.set_xlim(0, x_right)
+    ax.set_ylim(0, max_tps + y_padding)
+
+    plot_migrations(ax, migrations, t0, warmup_seconds)
+
     ax.legend()
 
     if save_path is not None:
-        fig.savefig(save_path)
+        fig.tight_layout()
+        fig.savefig(save_path, **_SAVEFIG_KW)
     if show:
         plt.show()
 

@@ -37,6 +37,8 @@ class InMemoryOperatorState(BaseAriaState):
         # Used to efficiently check if a key no longer should be in this worker due to migration
         self.set_keys_to_send: set[K] = set()
         self.keys_to_workers: dict[K, int] = {}
+        # Partitions this worker owns under the current assignment
+        self.owned_partitions: set[OperatorPartition] = set(self.operator_partitions)
 
     def add_keys_to_send(self, keys_to_send: dict[OperatorPartition, K]) -> None:
         self.keys_to_send = keys_to_send
@@ -168,10 +170,10 @@ class InMemoryOperatorState(BaseAriaState):
             while keys and c < batch_size:
                 key, new_partition = keys.pop()
                 value = self.data[operator_partition].pop(key, None)
-                self.keys_sent[key] = new_partition
                 if value is None:
                     # Key was deleted between rehash and transfer — skip it
                     continue
+                self.keys_sent[key] = new_partition
                 batch_to_send[(operator_name, new_partition)][key] = value
                 c += 1
             if not keys:
@@ -185,6 +187,10 @@ class InMemoryOperatorState(BaseAriaState):
         all_partitions = set(self.data.keys())
         for operator_partition in all_partitions:
             if not self.data[operator_partition]:
+                if operator_partition in self.remote_keys:
+                    continue  # still expecting incoming data
+                if operator_partition in self.owned_partitions:
+                    continue
                 del self.data[operator_partition]
                 del self.write_sets[operator_partition]
                 del self.reads[operator_partition]
@@ -231,6 +237,9 @@ class InMemoryOperatorState(BaseAriaState):
             return self.remote_keys[operator_partition][key]
         return None
 
+    def set_owned_partitions(self, operator_partitions: set[OperatorPartition]) -> None:
+        self.owned_partitions = {tuple(op) for op in operator_partitions}
+
     def add_new_operator_partition(self, operator_partition: OperatorPartition) -> None:
         operator_partition = tuple(operator_partition)
         if operator_partition not in self.operator_partitions:
@@ -246,6 +255,19 @@ class InMemoryOperatorState(BaseAriaState):
             self.global_write_sets[operator_partition] = {}
             self.global_reads[operator_partition] = {}
             self.global_read_sets[operator_partition] = {}
+
+    def discard_remote_key(self, operator_partition: OperatorPartition, key: K) -> None:
+        """Drop a pending incoming-migration entry for a key.
+
+        Called when the source worker reports it no longer holds the key (a None
+        on-demand response). The key is treated as absent locally so the waiting
+        transaction can proceed and the key is not re-requested every epoch.
+        """
+        operator_partition = tuple(operator_partition)
+        if operator_partition in self.remote_keys:
+            self.remote_keys[operator_partition].pop(key, None)
+            if not self.remote_keys[operator_partition]:
+                del self.remote_keys[operator_partition]    
 
     def add_remote_keys(
         self,
@@ -346,8 +368,8 @@ class InMemoryOperatorState(BaseAriaState):
         if key in self.data[operator_partition]:
             # During migration: a key still in data but pending send to another
             # partition should not be considered as belonging here.
-            if operator_partition in self.keys_to_send:
-                return not any(k == key for k, _ in self.keys_to_send[operator_partition])
+            if self.set_keys_to_send:
+                return key not in self.set_keys_to_send
             return True
         # During migration: key is expected to arrive from a remote worker
         return self.in_remote_keys(key, operator_name, partition)

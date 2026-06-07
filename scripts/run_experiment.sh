@@ -92,7 +92,27 @@ if [[ "$DEPLOY_MODE" == "k8s-minikube" || "$DEPLOY_MODE" == "k8s-cluster" ]]; th
 else
     # docker-compose mode
     bash scripts/start_styx_cluster.sh "$n_part" "$epoch_size" "$styx_threads_per_worker" "$enable_compression" "$use_composite_keys" "$use_fallback_cache" "$autoscaling_enabled"
-    sleep 10
+
+    # Wait for at least one worker to register with the coordinator
+    echo "Waiting for workers to register with coordinator..."
+    max_wait=120
+    waited=0
+    while true; do
+        worker_count=$(curl -s http://localhost:8000/metrics 2>/dev/null | grep -E '^live_worker_count ' | awk '{print $2}' | cut -d. -f1 || true)
+        if [[ -n "$worker_count" && "$worker_count" -ge 1 ]]; then
+            echo "Workers ready: $worker_count worker(s) registered"
+            break
+        fi
+        if [[ "$waited" -ge "$max_wait" ]]; then
+            echo "ERROR: Timed out waiting for workers after ${max_wait}s"
+            exit 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+        if (( waited % 5 == 0 )); then
+            echo "  Still waiting for workers... (${waited}s / ${max_wait}s)"
+        fi
+    done
 fi
 
 if [[ $workload_name == "ycsbt" ]]; then
@@ -146,7 +166,7 @@ if [[ "$DEPLOY_MODE" == "k8s-minikube" || "$DEPLOY_MODE" == "k8s-cluster" ]]; th
         sudo kill "$KUBEFWD_PID" 2>/dev/null || true
         unset KUBEFWD_PID
     fi
-    bash scripts/uninstall_styx_cluster_with_helm.sh
+    #bash scripts/uninstall_styx_cluster_with_helm.sh
 else
     #bash scripts/stop_styx_cluster.sh "$styx_threads_per_worker"
     docker compose stop coordinator worker 

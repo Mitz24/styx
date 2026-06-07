@@ -301,9 +301,12 @@ class Worker:
             )
 
     def _ensure_local_state_partitions(self) -> None:
-        for op_part in set(self.registered_operators.keys()):
+        owned = set(self.registered_operators.keys())
+        for op_part in owned:
             if op_part not in self.local_state.operator_partitions:
                 self.local_state.add_new_operator_partition(op_part)
+        # Mark these as owned so the async-migration cleanup keeps them even if empty.
+        self.local_state.set_owned_partitions(owned)
 
     # -----------------------
     # Handlers
@@ -652,11 +655,13 @@ class Worker:
                 logging.warning("MIGRATION | ReceiveRemoteKey on standby — state not yet initialized, skipping")
                 return
             self.local_state.set_data_from_migration(operator_partition, key, value)
-            # Guard: the event may have been already signaled by the async
-            # migration handler, or may not exist if no transaction requested it.
             op = tuple(operator_partition)
             if value is None:
-                return
+                # The source worker no longer holds this key. This happens when the key
+                # has no committed state to migrate (e.g. a key that has not been created
+                # yet) or it was already delivered through an async migration batch.
+                logging.warning(f"MIGRATION | ReceiveRemoteKey received None for {operator_partition} {key}")
+                #self.local_state.discard_remote_key(op, key)
             if (
                 op in self.protocol_networking.wait_remote_key_event
                 and key in self.protocol_networking.wait_remote_key_event[op]
@@ -747,7 +752,9 @@ class Worker:
                 f"MIGRATION | PHASE B Runtime rebuilt | took: {t_deploy_end - t_deploy_start}",
             )
 
-            # 9. Start protocol with background migration
+            # 9. Start protocol with background migration.
+            # If this worker ended up with no partitions (scale-down victim),
+            # start() will skip the function_scheduler but migration sender still runs
             self.function_execution_protocol.start()
             self.function_execution_protocol.started.set()
             if not self.registered_operators:

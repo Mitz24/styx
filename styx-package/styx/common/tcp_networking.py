@@ -333,7 +333,6 @@ class NetworkingManager(BaseNetworking):
 
         async with self.wait_remote_key_lock:
             if operator_partition not in self.wait_remote_key_event:
-                # This shouldn't happen if request_key was called, but handle gracefully
                 logging.error(f"wait_for_remote_key_event: no entry for {operator_partition}, key={key}")
                 return
             if key not in self.wait_remote_key_event[operator_partition]:

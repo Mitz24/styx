@@ -5,8 +5,10 @@ import argparse
 import matplotlib.pyplot as plt
 import os
 
-from plot_latency_ycsb import plot_latency
-from plot_throughput_ycsb import plot_throughput
+from matplotlib.lines import Line2D
+from plot_latency import plot_latency
+from plot_throughput import plot_throughput
+from plot_workers import plot_backlog, plot_workers
 
 RESULTS_DIR = Path(__file__).resolve().parent
 
@@ -32,7 +34,7 @@ def find_runs_by_keyword(keywords: List[str]) -> List[Path]:
 # Select the most recent run as the default
 def _select_default_run(runs: List[Path]) -> Path:
     def sort_key(run: Path) -> float:
-        return run.stat().st_mtime  
+        return run.stat().st_mtime
 
     return max(runs, key=sort_key)
 
@@ -51,7 +53,7 @@ def interactive_select(runs: List[Path]) -> Path | None:
 
     while True:
         choice = input(
-            f"\nSelect run number to plot (or 'q' to quit): "
+            "\nSelect run number to plot (or 'q' to quit): "
         ).strip()
         if choice.lower() in {"q", "quit", "exit"}:
             return None
@@ -71,37 +73,85 @@ def interactive_select(runs: List[Path]) -> Path | None:
         return runs[idx - 1]
 
 
+def _output_basename(keywords: List[str]) -> str:
+    return "_".join(keywords).lower()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Interactive helper to plot YCSB latency and throughput side-by-side."
+        description=(
+            "Interactive helper to plot throughput, latency, workers, and backlog "
+            "(stacked vertically) for any benchmark run."
+        )
     )
     parser.add_argument(
         "workload",
         nargs="+",
-        help="Workloads to select",
+        help="Keywords to match run directories (e.g. ycsb, tpcc, dmr, dhr)",
     )
     args = parser.parse_args()
 
     runs = find_runs_by_keyword(args.workload)
+    output_name = f"combined_{_output_basename(args.workload)}.pdf"
 
     while True:
         selected = interactive_select(runs)
         if not selected:
             return
 
-        fig, (ax_latency, ax_throughput) = plt.subplots(1, 2, figsize=(16, 5))
-        plot_latency(
-            selected,
-            ax=ax_latency,
-            save_path=os.path.join(RESULTS_DIR, "latency_ycsb.pdf"),
+        x_window_sec = None
+
+        fig, axes = plt.subplots(
+            4,
+            1,
+            sharex=True,
+            figsize=(16, 20),
         )
         plot_throughput(
             selected,
-            ax=ax_throughput,
-            save_path=os.path.join(RESULTS_DIR, "throughput_ycsb.pdf"),
+            axes=axes[0],
+            save_path=None,
+            show=False,
+            x_max_seconds=x_window_sec,
+        )
+        axes[0].set_xlabel("")
+        plot_latency(selected, ax=axes[1], save_path=None)
+        axes[1].set_xlabel("")
+        plot_workers(
+            selected,
+            ax=axes[2],
+            x_max_seconds=x_window_sec,
+            save_path=None,
+            show=False,
+        )
+        axes[2].set_xlabel("")
+        plot_backlog(
+            selected,
+            ax=axes[3],
+            x_max_seconds=x_window_sec,
+            save_path=None,
+            show=False,
         )
 
         fig.tight_layout()
+        migration_handles = [
+            Line2D([0], [0], color="red", linestyle="--", linewidth=2, alpha=0.8, label="Migration Start"),
+            Line2D([0], [0], color="green", linestyle="--", linewidth=2, alpha=0.8, label="Migration End"),
+        ]
+        fig.legend(
+            handles=migration_handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 1.0),
+            ncol=2,
+            frameon=False,
+            fontsize=26,
+        )
+        fig.subplots_adjust(top=0.96)
+        fig.savefig(
+            os.path.join(RESULTS_DIR, output_name),
+            bbox_inches="tight",
+            pad_inches=0.05,
+        )
         #combined_path = selected / args.combined_name
         #fig.savefig(combined_path)
         plt.show()

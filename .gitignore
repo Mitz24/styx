@@ -157,7 +157,8 @@ grafana-enterprise-11.5.1.darwin-amd64.tar.gz
 grafana_data/
 ycsb_dataset_*
 prometheus-data/
-results/
+results/*
+!results/plot*
 models/*
 !models/.gitkeep
 
