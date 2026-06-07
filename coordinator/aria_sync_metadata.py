@@ -1,15 +1,15 @@
 from collections import defaultdict
 from typing import Any
 
-from styx.common.message_types import MessageType
 from styx.common.logging import logging
+from styx.common.message_types import MessageType
 
 
 class AriaSyncMetadata:
     def __init__(self, n_workers: int) -> None:
         self.n_workers: int = n_workers
-        # Per-message-type arrival sets. Each barrier phase tracks its own arrivals 
-        # so that concurrently-processed phases cannot contaminate each other's counts. 
+        # Per-message-type arrival sets. Each barrier phase tracks its own arrivals
+        # so that concurrently-processed phases cannot contaminate each other's counts.
         self.arrived: dict[MessageType, set[int]] = defaultdict(set)
         self.sent_proceed_msg: bool = False
         self.logic_aborts_everywhere: set[int] = set()

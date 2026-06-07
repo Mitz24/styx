@@ -84,11 +84,11 @@ class InMemoryOperatorState(BaseAriaState):
             if operator_partition not in self.data:
                 self.add_new_operator_partition(operator_partition)
             self.data[operator_partition][key] = data
-            # Only remove from remote_keys if the key exists there
+            # Only remove from remote_keys when we actually received the data.
             # A None response means the async migration batch already transferred
-            # this key — the batch will arrive and set it via set_batch_data_from_migration
-            if operator_partition in self.remote_keys and key in self.remote_keys[operator_partition]:
-                del self.remote_keys[operator_partition][key]
+            # this key — the batch will arrive and set it via set_batch_data_from_migration.
+            if operator_partition in self.remote_keys:
+                self.remote_keys[operator_partition].pop(key, None)
                 if not self.remote_keys[operator_partition]:
                     del self.remote_keys[operator_partition]
 
@@ -164,7 +164,7 @@ class InMemoryOperatorState(BaseAriaState):
         batch_to_send: dict[OperatorPartition, KVPairs] = defaultdict(dict)
         c = 0
         operator_partitions_to_clear = []
-        # logging.warning(f"ASYNC_MIGRATION | Batch size {batch_size}, keys_to_send: {self.keys_to_send}")
+
         for operator_partition, keys in self.keys_to_send.items():
             operator_name, _ = operator_partition
             while keys and c < batch_size:
@@ -187,10 +187,8 @@ class InMemoryOperatorState(BaseAriaState):
         all_partitions = set(self.data.keys())
         for operator_partition in all_partitions:
             if not self.data[operator_partition]:
-                if operator_partition in self.remote_keys:
+                if operator_partition in self.remote_keys or operator_partition in self.owned_partitions:
                     continue  # still expecting incoming data
-                if operator_partition in self.owned_partitions:
-                    continue
                 del self.data[operator_partition]
                 del self.write_sets[operator_partition]
                 del self.reads[operator_partition]
@@ -267,7 +265,7 @@ class InMemoryOperatorState(BaseAriaState):
         if operator_partition in self.remote_keys:
             self.remote_keys[operator_partition].pop(key, None)
             if not self.remote_keys[operator_partition]:
-                del self.remote_keys[operator_partition]    
+                del self.remote_keys[operator_partition]
 
     def add_remote_keys(
         self,

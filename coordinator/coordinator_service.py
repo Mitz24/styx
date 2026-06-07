@@ -22,6 +22,7 @@ from coordinator_metadata import Coordinator
 from prometheus_client import Counter, Gauge, start_http_server
 from setuptools._distutils.util import strtobool
 from sliding_window_metric import SlidingWindowMetric
+from styx.common.base_networking import SOCKET_RCV_BUF, SOCKET_SND_BUF
 from styx.common.logging import logging
 from styx.common.message_types import MessageType
 from styx.common.metrics import WorkerEpochStats
@@ -116,8 +117,29 @@ class CoordinatorService:
         self.puller_task: asyncio.Task | None = None
 
     def _init_listen_sockets(self) -> None:
-        self.coor_socket = self._bind_listen_tcp_socket(SERVER_PORT)
-        self.protocol_socket = self._bind_listen_tcp_socket(SERVER_PORT + 1)
+        self.coor_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.coor_socket.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_LINGER,
+            struct.pack("ii", 1, 0),
+        )  # Enable LINGER, timeout 0
+        self.coor_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.coor_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_SND_BUF)
+        self.coor_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_RCV_BUF)
+        self.coor_socket.bind(("0.0.0.0", SERVER_PORT))  # noqa: S104
+        self.coor_socket.setblocking(False)
+
+        self.protocol_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.protocol_socket.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_LINGER,
+            struct.pack("ii", 1, 0),
+        )  # Enable LINGER, timeout 0
+        self.protocol_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.protocol_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_SND_BUF)
+        self.protocol_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_RCV_BUF)
+        self.protocol_socket.bind(("0.0.0.0", SERVER_PORT + 1))  # noqa: S104
+        self.protocol_socket.setblocking(False)
 
     def _init_recovery_fields(self) -> None:
         self.aria_metadata: AriaSyncMetadata | None = None
@@ -691,9 +713,9 @@ class CoordinatorService:
             self.network_tx_gauge.labels(instance=worker_id).set(tx_net)  # KB
 
             heartbeat_rcv_time = timer()
-            #logging.info(
+            # logging.info(
             #    f"Heartbeat received from: {worker_id} at time: {heartbeat_rcv_time}",
-            #)
+            # )
 
             self.coordinator.register_worker_heartbeat(worker_id, heartbeat_rcv_time)
 
@@ -997,7 +1019,7 @@ class CoordinatorService:
         # Backlog must be essentially zero before considering downscale,
         # use value a little above zero to account for timing jitter on the worker side
         total_backlog = sum(self.epoch_backlog_accum.values())
-        if n_workers <= 1 or total_backlog >= 10 or self._capacity_ewma is None:
+        if n_workers <= 1 or total_backlog >= self.pid_controller.backlog_threshold or self._capacity_ewma is None:
             return False, 0
 
         per_worker_cap = self._capacity_ewma / n_workers
@@ -1225,7 +1247,14 @@ class CoordinatorService:
                         data = await reader.readexactly(8)
                         (size,) = struct.unpack(">Q", data)
                         message = await reader.readexactly(size)
-                        self.aio_task_scheduler_coord.create_task(
+                        # Unbounded: this scheduler also runs
+                        # `heartbeat_monitor_coroutine` (a perpetual loop) which
+                        # drives recovery via `wait_cluster_healthy()` — that
+                        # await is unblocked by `_handle_ready_after_recovery`
+                        # running through this same scheduler. A bounded slot
+                        # held by a suspended awaiter could starve the setter
+                        # under a large cluster.
+                        self.aio_task_scheduler_coord.create_unbounded_task(
                             self.coordinator_controller(writer, message, pool),
                         )
                 except asyncio.IncompleteReadError as e:
@@ -1491,7 +1520,11 @@ class CoordinatorService:
         logging.warning("Coordinator Booted Successfully")
         self.init_snapshot_bucket()
         logging.warning("Coordinator Connected to S3")
-        self.aio_task_scheduler_coord.create_task(self.heartbeat_monitor_coroutine())
+        # Unbounded: heartbeat_monitor is a long-lived loop that also drives
+        # recovery (awaits `wait_cluster_healthy`). It must not consume a
+        # semaphore slot while suspended, or it would permanently reduce the
+        # scheduler's capacity and could starve `_handle_ready_after_recovery`.
+        self.aio_task_scheduler_coord.create_unbounded_task(self.heartbeat_monitor_coroutine())
         logging.warning("Coordinator Heartbeat Sentinel online")
         self.snapshotting_task = asyncio.create_task(self.send_snapshot_marker())
         logging.warning("Coordinator Snapshotting online")

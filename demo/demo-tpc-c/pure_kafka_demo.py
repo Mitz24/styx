@@ -56,8 +56,8 @@ STYX_PORT: int = int(os.getenv("STYX_PORT", "8886"))
 KAFKA_URL: str = os.getenv("KAFKA_URL", "localhost:9092")
 warmup_seconds = int(sys.argv[6])
 N_W = int(sys.argv[7])
-epoch_size = int(sys.argv[11])
-load_config_path: str = sys.argv[12]
+epoch_size = int(sys.argv[10])
+load_config_path: str = sys.argv[11]
 current_time = datetime.now().strftime("%m%d_%H%M")
 SAVE_DIR: str = f"{sys.argv[1]}/tpcc_{messages_per_second}tps_{N_PARTITIONS}part_{current_time}"
 if not os.path.exists(SAVE_DIR):
@@ -77,12 +77,10 @@ MIN_PAYMENT = 1.0
 MAX_PAYMENT = 5000.0
 enable_compression: bool = bool(strtobool(sys.argv[8]))
 use_composite_keys: bool = bool(strtobool(sys.argv[9]))
-use_fallback_cache: bool = bool(strtobool(sys.argv[10]))
 os.environ["ENABLE_COMPRESSION"] = str(enable_compression)
 os.environ["USE_COMPOSITE_KEYS"] = str(use_composite_keys)
-os.environ["USE_FALLBACK_CACHE"] = str(use_fallback_cache)
-autoscaling_enabled: bool = sys.argv[13].lower() == "true"
-kill_at = int(sys.argv[14]) if len(sys.argv) > 14 else -1
+autoscaling_enabled: bool = sys.argv[12].lower() == "true"
+kill_at = int(sys.argv[13]) if len(sys.argv) > 14 else -1
 
 
 customers_per_district: dict[tuple, list] = {}
@@ -425,7 +423,7 @@ def tpc_c_workload_generator(proc_num):
 
 def benchmark_runner(proc_num) -> dict[bytes, dict]:
     print(f'Generator: {proc_num} starting with: EC={os.environ["ENABLE_COMPRESSION"]} '
-          f'CK={os.environ["USE_COMPOSITE_KEYS"]} FC={os.environ["USE_FALLBACK_CACHE"]}')
+          f'CK={os.environ["USE_COMPOSITE_KEYS"]}')
     styx = SyncStyxClient(STYX_HOST, STYX_PORT, kafka_url=KAFKA_URL)
     time.sleep(proc_num * 0.2)
     styx.open(consume=False)
@@ -514,7 +512,6 @@ if __name__ == "__main__":
         N_W,
         enable_compression,
         use_composite_keys,
-        use_fallback_cache
     )
 
     if autoscaling_enabled:
