@@ -12,6 +12,7 @@ services:
       - HEARTBEAT_LIMIT=5000
       - HEARTBEAT_CHECK_INTERVAL=500
       - ENABLE_AUTOSCALE=${ENABLE_AUTOSCALE:-true}
+      - MIGRATION_COLD_START_HORIZON_SEC=${MIGRATION_COLD_START_HORIZON_SEC:-45}
       - S3_ENDPOINT=http://rustfs:9000
       - S3_ACCESS_KEY=rustfsadmin
       - S3_SECRET_KEY=rustfsadmin
@@ -61,7 +62,7 @@ services:
       resources:
         limits:
           cpus: "2"
-          memory: "4GB"
+          memory: "8GB"
 
   worker-standby:
     profiles:
@@ -86,7 +87,7 @@ services:
       resources:
         limits:
           cpus: "2"
-          memory: "4GB"
+          memory: "8GB"
 
 volumes:
   grafana_data:

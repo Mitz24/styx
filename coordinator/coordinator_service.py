@@ -61,9 +61,14 @@ HEARTBEAT_CHECK_INTERVAL: int = int(
 S3_INIT_RETRY_SEC: float = float(os.getenv("S3_INIT_RETRY_SEC", "2"))
 S3_INIT_MAX_RETRIES: int = int(os.getenv("S3_INIT_MAX_RETRIES", "30"))
 
-ASYNC_MIGRATION_BATCH_SIZE: int = int(os.getenv("ASYNC_MIGRATION_BATCH_SIZE", "2000"))
 SEQUENCE_MAX_SIZE: int = int(os.getenv("SEQUENCE_MAX_SIZE", "1_000"))
 CHRONOS_FORECAST_INTERVAL: float = float(os.getenv("CHRONOS_FORECAST_INTERVAL", "2.0"))
+
+# Migration time estimation.
+# Cold-start horizon used only before the first migration has been measured;
+# afterwards the estimate is driven entirely by the learned per-moved-key rate.
+MIGRATION_COLD_START_HORIZON_SEC: float = float(os.getenv("MIGRATION_COLD_START_HORIZON_SEC", "45"))
+MIN_CHRONOS_PREDICTION_HORIZON: int = int(os.getenv("MIN_CHRONOS_PREDICTION_HORIZON", "10"))
 
 CoordHandler = Callable[[StreamWriter, bytes, concurrent.futures.ProcessPoolExecutor], Awaitable[None]]
 
@@ -259,6 +264,7 @@ class CoordinatorService:
             MessageType.MigrationRepartitioningDone: asyncio.Lock(),
             MessageType.MigrationDone: asyncio.Lock(),
             MessageType.MigrationInitDone: asyncio.Lock(),
+            MessageType.MigrationReadyToStart: asyncio.Lock(),
             MessageType.RegisterWorker: asyncio.Lock(),
             MessageType.SnapID: asyncio.Lock(),
             MessageType.Heartbeat: asyncio.Lock(),
@@ -288,6 +294,7 @@ class CoordinatorService:
             MessageType.UpdateExecutionGraph: self._handle_update_execution_graph,
             MessageType.MigrationRepartitioningDone: self._handle_migration_repartitioning_done,
             MessageType.MigrationInitDone: self._handle_migration_init_done,
+            MessageType.MigrationReadyToStart: self._handle_migration_ready_to_start,
             MessageType.RegisterWorker: self._handle_register_worker,
             MessageType.SnapID: self._handle_snap_id,
             MessageType.Heartbeat: self._handle_heartbeat,
@@ -305,12 +312,16 @@ class CoordinatorService:
 
         self.last_scale_action_time: float = time.time()
         self.scale_window_seconds: int = 10
-        self.migration_time_window: SlidingWindowMetric = SlidingWindowMetric(self.scale_window_seconds)
         self.epoch_duration_window = SlidingWindowMetric(self.scale_window_seconds)
         self.tps_sliding_window: SlidingWindowMetric = SlidingWindowMetric(self.scale_window_seconds)
 
+        self.sec_per_moved_key_ewma: float | None = None
+        self.sec_per_moved_key_ewma_alpha: float = 0.5
+        self._migration_keys_to_move: float = 0.0
+
         self._last_action_was_downscale: bool = False
         self._downscale_suppressed_until: float = 0.0
+        self._downscale_strikes: int = 0
         self._downscale_penalty_base: float = self.scale_cooldown_period * 2
         self._downscale_penalty_max: float = self.scale_cooldown_period * 30
 
@@ -327,8 +338,10 @@ class CoordinatorService:
         self._capacity_ewma: float | None = None
         self._capacity_ewma_alpha: float = 0.3  # smoothing factor (0→slow, 1→no smoothing)
 
+        # Total live state keys across the cluster (refreshed each epoch sync).
+        self.total_keys: int = 0
+
         # Chronos forecaster (background process)
-        self.total_keys_accum: int = 0
         self.metric_buffer: AggregatingMetricBuffer = AggregatingMetricBuffer(bucket_interval=1.0, max_buckets=512)
         self.chronos_forecaster: ChronosForecaster | None = None
         self.forecaster_task: asyncio.Task | None = None
@@ -358,6 +371,9 @@ class CoordinatorService:
         # Ensure we never reduce partitions below the current count (Kafka can't shrink partitions)
         current_partitions = self.coordinator.submitted_graph.max_operator_parallelism
         effective_n_partitions = max(new_n_partitions, current_partitions)
+        # Actual live operator partition count (basis for how many keys rehash);
+        # captured before the graph update mutates it.
+        old_operator_partitions = self._graph_operator_partitions(self.coordinator.submitted_graph)
 
         new_graph = deepcopy(self.coordinator.submitted_graph)
         new_graph.max_operator_parallelism = effective_n_partitions
@@ -400,6 +416,12 @@ class CoordinatorService:
             f"new graph={new_graph}"
         )
         await self.coordinator.update_stateflow_graph(new_graph)
+        # Keys actually rehashed to a new partition by this scale-up; used to
+        # normalize the measured duration into a per-moved-key rate on completion.
+        self._migration_keys_to_move = self.total_keys * self._f_migrate(
+            old_operator_partitions,
+            effective_n_partitions,
+        )
         start_time = time.time_ns()
         self.migration_start_time_gauge.set(start_time / 1_000_000)
         self.migration_start_time = start_time
@@ -421,7 +443,7 @@ class CoordinatorService:
                 f"DOWNSCALE | correction detected (strike #{self._downscale_strikes}); "
                 f"suppressing downscale for {penalty:.0f}s"
             )
-        elif is_downscale and now > self._downscale_suppressed_until:
+        elif is_downscale and now > self._downscale_suppressed_until and self._last_action_was_downscale:
             # long stretch with no correction -> forgive past strikes
             self._downscale_strikes = 0
         self._last_action_was_downscale = is_downscale
@@ -474,6 +496,8 @@ class CoordinatorService:
             f"workers_participating={len(self.coordinator.worker_pool.get_participating_workers())}"
         )
         await self.coordinator.update_stateflow_graph(graph, include_all_live=True)
+
+        self._migration_keys_to_move = 0.0
         start_time = time.time_ns()
         self.migration_start_time_gauge.set(start_time / 1_000_000)
         self.migration_start_time = start_time
@@ -550,6 +574,10 @@ class CoordinatorService:
         self.migration_in_progress = True
         await self.stop_snapshotting()
 
+        old_partitions = self._graph_operator_partitions(self.coordinator.submitted_graph)
+        new_partitions = self._graph_operator_partitions(graph)
+        self._migration_keys_to_move = self.total_keys * self._f_migrate(old_partitions, new_partitions)
+
         logging.warning(f"MIGRATION | START {graph}")
         await self.coordinator.update_stateflow_graph(graph)
 
@@ -613,6 +641,34 @@ class CoordinatorService:
             self.aria_metadata = AriaSyncMetadata(n_workers)
             await self.protocol_networking.close_all_connections()
             await self.finalize_migration()
+            await self.migration_metadata.cleanup(mt)
+
+    async def _handle_migration_ready_to_start(
+        self,
+        _: StreamWriter,
+        data: bytes,
+        __: concurrent.futures.ProcessPoolExecutor,
+    ) -> None:
+        """
+        Each participating worker reports here once it has finished Phase B
+        (runtime rebuilt, protocol relaunched). Only when every worker has
+        reported do we broadcast the go-ahead, so no worker starts the
+        post-migration epoch while a peer is still rebuilding the
+        transactional protocol and dropping important messages.
+        """
+        mt = MessageType.MigrationReadyToStart
+        async with self.networking_locks[mt]:
+            (worker_id,) = self.networking.decode_message(data)
+            sync_complete: bool = await self.migration_metadata.set_empty_sync_done(mt)
+            logging.warning(
+                f"MIGRATION | MigrationReadyToStart | worker {worker_id} | "
+                f"{self.migration_metadata.sync_sum[mt]}/{self.migration_metadata.n_workers}",
+            )
+            if not sync_complete:
+                return
+
+            logging.warning("MIGRATION | MigrationReadyToStart | all workers ready, releasing")
+            await self.finalize_migration_ready_to_start()
             await self.migration_metadata.cleanup(mt)
 
     async def _handle_register_worker(
@@ -941,12 +997,84 @@ class CoordinatorService:
                     new_partition_num = len(self.coordinator.worker_pool.get_participating_workers()) + to_add
                     await self.scale_up(new_partition_num, to_add)
 
+    @staticmethod
+    def _f_migrate(n_partitions_old: int, n_partitions_new: int) -> float:
+        """Fraction of keys that change partition under hash repartitioning."""
+        if n_partitions_new > n_partitions_old:
+            return 1.0 - n_partitions_old / n_partitions_new
+        if n_partitions_new < n_partitions_old:
+            return 1.0 - n_partitions_new / n_partitions_old
+        return 0.0
+
+    @staticmethod
+    def _graph_operator_partitions(graph) -> int:
+        if graph is None:
+            return 1
+        return max((op.n_partitions for op in graph.nodes.values()), default=1)
+
+    def _planned_partition_counts(self) -> tuple[int, int]:
+        """Pessimistic partition counts for the next possible scale-up."""
+        n_workers = len(self.coordinator.worker_pool.get_participating_workers())
+        n_standby = self.coordinator.worker_pool.pending_standby_worker_count()
+        max_to_add = min(n_workers, n_standby) if n_standby > 0 else 0
+        if self.coordinator.graph_submitted and self.coordinator.submitted_graph is not None:
+            n_partitions_old = self._graph_operator_partitions(self.coordinator.submitted_graph)
+        else:
+            n_partitions_old = max(n_workers, 1)
+        n_partitions_new = n_workers + max_to_add
+        logging.warning(
+            f"PLANNED PARTITION COUNTS | n_partitions_old={n_partitions_old} | n_partitions_new={n_partitions_new}"
+        )
+        return n_partitions_old, n_partitions_new
+
+    def _expected_keys_to_move(self, total_keys: int) -> float:
+        """Keys expected to change partition for the next planned scale-up."""
+        n_partitions_old, n_partitions_new = self._planned_partition_counts()
+        return total_keys * self._f_migrate(n_partitions_old, n_partitions_new)
+
+    def _note_migration_duration(self, duration_sec: float) -> None:
+        """Fold a completed migration into the learned per-moved-key rate.
+
+        Normalizing by the number of keys actually moved lets a single learned
+        rate generalize across migration sizes and directions, so we no longer
+        depend on hand-tuned hashing/transfer constants.
+        """
+        keys_moved = self._migration_keys_to_move
+        if keys_moved <= 0:
+            # Nothing moved (e.g. same partition count) -> no rate signal.
+            return
+        sample = duration_sec / keys_moved
+        if self.sec_per_moved_key_ewma is None:
+            self.sec_per_moved_key_ewma = sample
+        else:
+            self.sec_per_moved_key_ewma += self.sec_per_moved_key_ewma_alpha * (sample - self.sec_per_moved_key_ewma)
+        logging.warning(
+            f"MIGRATION RATE | duration={duration_sec:.2f}s | keys_moved={keys_moved:.0f} | "
+            f"sample={sample * 1e6:.2f}us/key | ewma={self.sec_per_moved_key_ewma * 1e6:.2f}us/key",
+        )
+
     def _estimate_migration_time(self, total_keys: int) -> float:
-        estimated_migration_time = (
-            total_keys * self.epoch_duration_window.average() / ASYNC_MIGRATION_BATCH_SIZE
-        ) / 1000.0
-        self.migration_time_window.add(estimated_migration_time)
-        return self.migration_time_window.average()
+        """Estimate the migration duration for the Chronos forecast horizon.
+
+        Uses a single empirically learned cost per key actually moved. Before
+        the first migration has been measured we fall back to a conservative
+        cold-start constant; after that the estimate is fully data-driven.
+        """
+        keys_to_move = self._expected_keys_to_move(total_keys)
+
+        if self.sec_per_moved_key_ewma is None or keys_to_move <= 0:
+            horizon = MIGRATION_COLD_START_HORIZON_SEC
+            logging.warning(
+                f"MIGRATION ESTIMATE | horizon={horizon:.2f}s (cold-start) | "
+                f"keys_to_move={keys_to_move:.0f} | learned_rate=None",
+            )
+        else:
+            horizon = self.sec_per_moved_key_ewma * keys_to_move
+            logging.warning(
+                f"MIGRATION ESTIMATE | horizon={horizon:.2f}s | keys_to_move={keys_to_move:.0f} | "
+                f"rate={self.sec_per_moved_key_ewma * 1e6:.2f}us/key",
+            )
+        return max(horizon, float(MIN_CHRONOS_PREDICTION_HORIZON))
 
     def _resolve_scale_up_workers(self, to_add: int) -> int:
         """Scale up only activates workers from _standby_queue; clamp and skip if none left.
@@ -1056,12 +1184,10 @@ class CoordinatorService:
             if not context:
                 continue
 
-            estimated_migration_time = self._estimate_migration_time(self.total_keys)
-            logging.warning(f"Estimated migration time: {estimated_migration_time} seconds")
-
-            min_prediction_horizon = 10
+            prediction_horizon = self._estimate_migration_time(self.total_keys)
             self.chronos_forecaster.submit(
-                context, prediction_length=max(min_prediction_horizon, ceil(estimated_migration_time))
+                context,
+                prediction_length=ceil(prediction_horizon),
             )
             predictions = self.chronos_forecaster.poll()
             logging.warning(f"CHRONOS | predictions: {predictions}")
@@ -1186,6 +1312,7 @@ class CoordinatorService:
             self.migration_end_count.inc()
             migration_duration = (self.migration_end_time - self.migration_start_time) / 1_000_000_000
             logging.warning(f"MIGRATION_DURATION: {migration_duration:.2f} s")
+            self._note_migration_duration(migration_duration)
             await self.migration_metadata.cleanup(mt)
             self.migration_in_progress = False
 
@@ -1313,6 +1440,20 @@ class CoordinatorService:
                         ),
                         msg_type=MessageType.MigrationDone,
                         serializer=Serializer.MSGPACK,
+                    ),
+                )
+
+    async def finalize_migration_ready_to_start(self) -> None:
+        async with asyncio.TaskGroup() as tg:
+            for worker in self._migration_workers():
+                logging.warning(f"Sending MigrationReadyToStart to : {worker}")
+                tg.create_task(
+                    self.networking.send_message(
+                        worker.worker_ip,
+                        worker.worker_port,
+                        msg=b"",
+                        msg_type=MessageType.MigrationReadyToStart,
+                        serializer=Serializer.NONE,
                     ),
                 )
 
