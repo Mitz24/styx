@@ -141,10 +141,6 @@ def main() -> None:
     fig2.subplots_adjust(top=0.86, bottom=0.18, left=0.20, right=0.96)
     fig2.savefig(FIGDIR / "motivation_gradient.pdf")
     plt.close(fig2)
-    print(f"  wrote motivation_gradient.pdf")
-
-    print(f"\nOptimal schedule worker-seconds = {float((oracle_workers.to_numpy()[:-1] * np.diff(grid_s)).sum()):.0f}")
-    print(f"Figures written to {FIGDIR}")
 
 
 if __name__ == "__main__":
