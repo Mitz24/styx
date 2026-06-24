@@ -325,16 +325,6 @@ class CoordinatorService:
         self._downscale_penalty_base: float = self.scale_cooldown_period * 2
         self._downscale_penalty_max: float = self.scale_cooldown_period * 30
 
-        # Reactive control signals
-        self.latency_scale_up_enabled: bool = bool(strtobool(os.getenv("LATENCY_SCALE_UP", "true")))
-        self.latency_scale_up_threshold_ms: float = float(os.getenv("LATENCY_SCALE_UP_THRESHOLD_MS", "250.0"))
-        self.reactive_downscale_enabled: bool = bool(strtobool(os.getenv("REACTIVE_DOWNSCALE", "false")))
-        self.low_backlog_seconds_to_downscale: float = float(os.getenv("ZERO_BACKLOG_DOWNSCALE_S", "30.0"))
-        self.backlog_downscale_threshold: float = float(os.getenv("BACKLOG_DOWNSCALE_THRESHOLD", "50.0"))
-        self.downscale_cpu_threshold: float = float(os.getenv("DOWNSCALE_CPU_THRESHOLD", "50.0"))
-        self.worker_cpu_perc: dict[int, float] = {}
-        self.low_backlog_start_time: float | None = None
-
         self.pid_controller = BacklogPIDController()
         # Per-epoch accumulators: populated as each worker reports, consumed when all have synced
         self.epoch_backlog_accum: dict[int, float] = {}
@@ -774,7 +764,6 @@ class CoordinatorService:
             worker_id, cpu_perc, mem_util, rx_net, tx_net = self.networking.decode_message(data)
 
             self.cpu_usage_gauge.labels(instance=worker_id).set(cpu_perc)  # %
-            self.worker_cpu_perc[worker_id] = cpu_perc
             self.memory_usage_gauge.labels(instance=worker_id).set(mem_util)  # MB
             self.network_rx_gauge.labels(instance=worker_id).set(rx_net)  # KB
             self.network_tx_gauge.labels(instance=worker_id).set(tx_net)  # KB
@@ -996,56 +985,17 @@ class CoordinatorService:
             if self.enable_autoscale and not self.migration_in_progress:
                 smoothed_tps = self.tps_sliding_window.average() or 0.0
                 pid_output = self.pid_controller.compute(total_backlog, smoothed_tps)
-                avg_latency_ms = self.epoch_duration_window.average() or 0.0
-                latency_overloaded = (
-                    self.latency_scale_up_enabled and avg_latency_ms >= self.latency_scale_up_threshold_ms
-                )
-                cooldown_active = time.time() - self.last_scale_action_time < self.scale_cooldown_period
-
-                if total_backlog <= self.backlog_downscale_threshold:
-                    if self.low_backlog_start_time is None:
-                        self.low_backlog_start_time = time.time()
-                else:
-                    self.low_backlog_start_time = None
-
-                pid_triggered = pid_output >= self.pid_controller.scale_up_threshold
-                if (pid_triggered or latency_overloaded) and not cooldown_active:
-                    self.low_backlog_start_time = None
-                    # PID sets the magnitude
-                    to_add = max(1, round(pid_output / self.pid_controller.scale_up_threshold))
+                if pid_output >= self.pid_controller.scale_up_threshold and not (
+                    time.time() - self.last_scale_action_time < self.scale_cooldown_period
+                ):
+                    to_add = round(pid_output / self.pid_controller.scale_up_threshold)
                     to_add = self._resolve_scale_up_workers(to_add)
                     if to_add == 0:
                         self.last_scale_action_time = time.time()
                         logging.warning("PID | no standby workers available, skipping scale up")
                         return
-                    trigger = "PID" if pid_triggered else "latency"
-                    logging.warning(
-                        f"SCALE_UP | triggered by {trigger} | pid={pid_output:.3f} "
-                        f"backlog={total_backlog} latency={avg_latency_ms:.2f}ms adding={to_add}"
-                    )
                     new_partition_num = len(self.coordinator.worker_pool.get_participating_workers()) + to_add
                     await self.scale_up(new_partition_num, to_add)
-                else:
-                    live_ids = [w.worker_id for w in self.coordinator.worker_pool.get_live_workers()]
-                    cpu_samples = [self.worker_cpu_perc[wid] for wid in live_ids if wid in self.worker_cpu_perc]
-                    avg_cpu = sum(cpu_samples) / len(cpu_samples) if cpu_samples else 100.0
-                    if (
-                        self.reactive_downscale_enabled
-                        and total_backlog <= self.backlog_downscale_threshold
-                        and avg_cpu < self.downscale_cpu_threshold
-                        and len(live_ids) > 1
-                        and self.low_backlog_start_time is not None
-                        and time.time() - self.low_backlog_start_time >= self.low_backlog_seconds_to_downscale
-                        and not cooldown_active
-                        and time.time() > self._downscale_suppressed_until
-                    ):
-                        held_for = time.time() - self.low_backlog_start_time
-                        self.low_backlog_start_time = None
-                        logging.warning(
-                            f"SCALE_DOWN | reactive | backlog={total_backlog} held<{self.backlog_downscale_threshold:.0f} "
-                            f"for {held_for:.1f}s | avg_cpu={avg_cpu:.1f}%"
-                        )
-                        await self.scale_down(1)
 
     @staticmethod
     def _f_migrate(n_partitions_old: int, n_partitions_new: int) -> float:
@@ -1720,13 +1670,11 @@ class CoordinatorService:
         self.snapshotting_task = asyncio.create_task(self.send_snapshot_marker())
         logging.warning("Coordinator Snapshotting online")
 
-        if self.enable_autoscale and bool(strtobool(os.getenv("ENABLE_CHRONOS", "true"))):
+        if self.enable_autoscale:
             self.chronos_forecaster = ChronosForecaster()
             self.chronos_forecaster.start()
             self.forecaster_task = asyncio.create_task(self.chronos_forecast_loop())
             logging.warning("Chronos forecaster online (interval=%.1fs)", CHRONOS_FORECAST_INTERVAL)
-        elif self.enable_autoscale:
-            logging.warning("Chronos forecaster disabled (ENABLE_CHRONOS=false) — reactive control only")
 
         await self.tcp_service()
 
