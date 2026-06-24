@@ -4,10 +4,6 @@ services:
     ports:
       - "9000:9000"
     environment:
-      # Newer rustfs images refuse to start with default credentials on a
-      # non-loopback listener. Provide the credentials the coordinator expects
-      # (S3_ACCESS_KEY/S3_SECRET_KEY=rustfsadmin in docker-compose.yml) and
-      # explicitly allow them for this local/research deployment.
       - RUSTFS_ACCESS_KEY=rustfsadmin
       - RUSTFS_SECRET_KEY=rustfsadmin
       - RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true
