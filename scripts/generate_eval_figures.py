@@ -208,17 +208,8 @@ def main() -> None:
     reactive = load_run(DATA / "reactive_policy")
     styx = load_run(DATA / "builtin_styx_autoscaler")
 
-    print("Eval figures:")
     figure_reactive(reactive)
     figures_styx(styx)
-
-    print("\nSummary (post-warmup window):")
-    for name, run in [("Reactive policy", reactive), ("Built-in Styx", styx)]:
-        b, l = run["backlog"], run["latency"]
-        print(f"  {name:16s} worker-seconds={run['worker_seconds']:.0f}  "
-              f"peak_backlog={b.max():.0f}  end_backlog={b.iloc[-1]:.0f}  "
-              f"peak_latency={l.max():.0f}ms")
-    print(f"\nFigures written to {FIGDIR}")
 
 
 if __name__ == "__main__":
