@@ -49,4 +49,4 @@ if [[ "$enable_autoscale" == "true" ]]; then
     --build-arg use_composite_keys="$use_composite_keys"
 fi
 docker compose up --scale worker="$threaded_scale_factor" -d >/dev/null
-sleep 5
+sleep 30

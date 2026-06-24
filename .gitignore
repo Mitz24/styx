@@ -160,6 +160,9 @@ ycsb_dataset_*
 prometheus-data/
 results/*
 !results/plot*
+# Paper reproduction data: committed despite the global *.csv and results/* ignores above
+!results/paper_experiments/
+!results/paper_experiments/**
 models/*
 !models/.gitkeep
 

@@ -11,6 +11,7 @@ dependencies = [
     "msgspec==0.20.0",
     "psutil==7.2.1",
     "setuptools==80.10.1",
+    "Cython==3.2.4",
     "styx",
     "uvloop==0.22.1",
     "zstandard==0.25.0",

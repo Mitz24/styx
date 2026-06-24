@@ -80,6 +80,8 @@ def export_metrics(
     metrics = {
         "backlog": "sum(queue_backlog)",
         "num_workers": "live_worker_count",
+        "epoch_latency": "avg(worker_epoch_latency_ms)",
+        "committed_tps": "sum(rate(epoch_total_transactions_total[15s]))",
     }
     
     save_dir = Path(save_dir)
@@ -94,6 +96,74 @@ def export_metrics(
                 print(f"Exported {name}: {len(df)} data points")
         except Exception as e:
             print(f"Failed to export {name}: {e}")
+
+
+def plot_run(save_dir, warmup_seconds: Optional[int] = None) -> None:
+    """Write a quick-look overview.png (worker count, backlog, epoch latency) into
+    the run directory. Best-effort: skips silently if matplotlib or the metric
+    CSVs are unavailable, so it never blocks an experiment from finishing.
+
+    Time is relative to the run's own first sample (minus warmup), so it works
+    for any run regardless of absolute timestamps.
+    """
+    save_dir = Path(save_dir)
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:  # noqa: BLE001
+        print(f"Skipping overview plot (matplotlib unavailable): {e}")
+        return
+
+    if warmup_seconds is None:
+        try:
+            meta = json.loads((save_dir / "metadata.json").read_text())
+            warmup_seconds = int(meta.get("warmup_seconds", 0))
+        except Exception:  # noqa: BLE001
+            warmup_seconds = 0
+
+    panels = [
+        ("num_workers.csv", "Workers", "step", "C2"),
+        ("backlog.csv", "Queue backlog", "line", "C3"),
+        ("epoch_latency.csv", "Epoch latency (ms)", "line", "C0"),
+    ]
+    loaded, t0 = [], None
+    for fname, ylabel, kind, color in panels:
+        path = save_dir / fname
+        if not path.is_file():
+            continue
+        df = pd.read_csv(path)
+        if df.empty or "timestamp" not in df.columns or "value" not in df.columns:
+            continue
+        df = df.groupby("timestamp", as_index=False)["value"].mean().sort_values("timestamp")
+        loaded.append((df, ylabel, kind, color))
+        first = df["timestamp"].iloc[0]
+        t0 = first if t0 is None else min(t0, first)
+
+    if not loaded:
+        print("Skipping overview plot (no metric CSVs found)")
+        return
+
+    fig, axes = plt.subplots(len(loaded), 1, sharex=True, figsize=(10, 2.4 * len(loaded)))
+    if len(loaded) == 1:
+        axes = [axes]
+    for ax, (df, ylabel, kind, color) in zip(axes, loaded):
+        t = df["timestamp"].to_numpy() - t0 - warmup_seconds
+        v = df["value"].to_numpy()
+        mask = t >= 0
+        if kind == "step":
+            ax.step(t[mask], v[mask], where="post", color=color, lw=1.8)
+        else:
+            ax.plot(t[mask], v[mask], color=color, lw=1.5)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3, lw=0.5)
+    axes[-1].set_xlabel("Time since workload start (s)")
+    fig.suptitle(f"Run overview — {save_dir.name}")
+    fig.tight_layout()
+    out = save_dir / "overview.png"
+    fig.savefig(out, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved overview plot: {out}")
 
 
 def save_data(data, save_dir, filename):
@@ -126,3 +196,6 @@ def save_metadata(params: MetadataParams):
     metadata["n_threads"] = params.n_threads
 
     save_data(metadata, params.out_path, "metadata.json")
+
+    # Quick-look plot for this run (metric CSVs were written by export_metrics()).
+    plot_run(params.out_path, params.warmup_seconds)

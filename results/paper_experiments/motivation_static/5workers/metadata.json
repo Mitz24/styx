@@ -1,0 +1,15 @@
+{
+  "workload": "ycsb",
+  "messages_per_second": 6000,
+  "n_partitions": 5,
+  "n_keys": 100000,
+  "start": "2026-06-15T23:26:04.850017",
+  "end": "2026-06-15T23:31:38.330946",
+  "duration (s)": 300,
+  "epoch_size": 1000,
+  "warmup_seconds": 20,
+  "migration_start_time": null,
+  "migration_end_time": null,
+  "zipf_const": 0.99,
+  "n_threads": 1
+}
